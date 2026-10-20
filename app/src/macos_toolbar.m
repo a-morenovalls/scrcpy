@@ -1007,6 +1007,395 @@ normalized_address(NSString *input) {
     [menu addItem:[self scaleMenuItem]];
 }
 
+#pragma mark - Device controls
+
+static NSString *const kKeepAwakeKey = @"scrcpy.keepAwake";
+static NSString *const kAwakeStateKey = @"scrcpy.awakeOriginal";
+static NSString *const kScreenOffMax = @"2147483647";
+
+// Lock the rotation of the device to the requested orientation. scrcpy's own
+// rotation request restores the automatic rotation right away, and the device,
+// held upright, rotates back to portrait: here the rotation stays locked.
+- (void)rotateDevice:(enum sc_rotate_direction)direction {
+    NSString *target = direction == SC_ROTATE_LEFT ? @"left"
+                     : direction == SC_ROTATE_RIGHT ? @"right" : @"toggle";
+    NSString *cmd = [NSString stringWithFormat:
+        @"T=%@; r=$(dumpsys window displays"
+        @" | grep -oE 'mCurrentRotation=ROTATION_[0-9]+' | head -1"
+        @" | sed 's/.*_//');"
+        @" case $r in 90) c=1;; 180) c=2;; 270) c=3;; *) c=0;; esac;"
+        @" case $T in"
+        @" left) [ $c = 1 ] && n=0 || n=1;;"
+        @" right) [ $c = 3 ] && n=0 || n=3;;"
+        @" *) case $c in 1|3) n=0;; *) n=1;; esac;; esac;"
+        @" settings put system accelerometer_rotation 0;"
+        @" settings put system user_rotation $n; echo $n", target];
+    [self runShell:cmd
+           success:@"Device rotated"
+        completion:^(int status, NSString *out, NSString *err) {
+        if (status == 0) {
+            [self flash:[trimmed(out) isEqualToString:@"0"]
+                ? @"Device rotated: portrait"
+                : @"Device rotated: landscape"];
+        }
+    }];
+}
+
+- (void)rotateItem:(NSMenuItem *)item {
+    [self rotateDevice:(enum sc_rotate_direction) item.tag];
+}
+
+- (void)toggleAutoRotate:(id)sender {
+    [self runShell:@"[ \"$(settings get system accelerometer_rotation)\" = 1 ]"
+                   @" && settings put system accelerometer_rotation 0"
+                   @" || settings put system accelerometer_rotation 1"
+           success:@"Auto-rotate toggled"
+        completion:nil];
+}
+
+- (BOOL)keepAwakeEnabled {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kKeepAwakeKey];
+}
+
+- (NSString *)awakeStateKey {
+    return self.serial ?: @"default";
+}
+
+- (void)updateAwakeUI {
+    BOOL on = [self keepAwakeEnabled];
+    NSString *symbol = on ? @"sun.max.fill" : @"sun.max";
+    NSImage *image = menu_image(symbol, @"Keep device awake");
+    if (image) {
+        self.awakeItem.image = image;
+    }
+    self.awakeItem.toolTip = on ? @"Device stays awake (click to disable)"
+                                : @"Keep device awake";
+}
+
+// The device stays on (so it never locks) by setting the screen timeout to its
+// maximum. The original value is stored to be restored when the app closes.
+- (void)applyKeepAwake {
+    [self runAdb:@[@"shell", @"settings get system screen_off_timeout"]
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        if (status != 0) {
+            [self flash:@"Could not keep the device awake"];
+            return;
+        }
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        NSMutableDictionary *state =
+            [[defaults dictionaryForKey:kAwakeStateKey] mutableCopy]
+                ?: [NSMutableDictionary dictionary];
+        if (!state[[self awakeStateKey]]) {
+            NSString *current = trimmed(out);
+            BOOL numeric = current.length
+                && [current rangeOfCharacterFromSet:
+                       NSCharacterSet.decimalDigitCharacterSet.invertedSet]
+                       .location == NSNotFound;
+            state[[self awakeStateKey]] =
+                numeric && ![current isEqualToString:kScreenOffMax]
+                    ? current : @"60000";
+            [defaults setObject:state forKey:kAwakeStateKey];
+        }
+        [self runShell:[NSString stringWithFormat:
+                @"settings put system screen_off_timeout %@", kScreenOffMax]
+               success:@"The device will stay awake while scrcpy is open"
+            completion:nil];
+    }];
+}
+
+// Shell command that gives back the original screen timeout (and forgets it),
+// or nil if there is nothing to restore
+- (NSString *)takeKeepAwakeRestoreCommand {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSMutableDictionary *state =
+        [[defaults dictionaryForKey:kAwakeStateKey] mutableCopy];
+    NSString *original = state[[self awakeStateKey]];
+    if (!original) {
+        return nil;
+    }
+    [state removeObjectForKey:[self awakeStateKey]];
+    [defaults setObject:state forKey:kAwakeStateKey];
+    return [NSString stringWithFormat:
+        @"settings put system screen_off_timeout %@", original];
+}
+
+- (void)restoreKeepAwakeAsync {
+    NSString *cmd = [self takeKeepAwakeRestoreCommand];
+    if (cmd) {
+        [self runAdb:@[@"shell", cmd] stdoutFile:nil done:nil];
+    }
+}
+
+// Before the app quits: give back the device settings (screen timeout) and wake
+// the display if it was turned off from here, so that the device never stays
+// dark if the server could not restore it. Waits for adb, but not for long if
+// the device does not answer.
+- (void)shutdownSync {
+    NSMutableArray *commands = [NSMutableArray array];
+    NSString *restore = [self takeKeepAwakeRestoreCommand];
+    if (restore) {
+        [commands addObject:restore];
+    }
+    if ([self restoreOnQuit]) {
+        [commands addObjectsFromArray:[self restoreCommands]];
+    }
+    [self clearSimulationFlags];
+    if (self.screenOffUsed) {
+        // Ask the server to power the display on, then do it from adb too: the
+        // display must never stay dark after the app is gone
+        if (self.callback) {
+            self.callback(SC_TOOLBAR_BUTTON_SCREEN_ON, self.userdata);
+            usleep(250 * 1000);
+        }
+        [commands addObject:@"cmd display power-reset 0"];
+        [commands addObject:@"input keyevent KEYCODE_WAKEUP"];
+        self.screenOffUsed = NO;
+    }
+    if (!commands.count) {
+        return;
+    }
+
+    NSMutableArray *argv = [NSMutableArray arrayWithObject:self.adb];
+    if (self.serial) {
+        [argv addObjectsFromArray:@[@"-s", self.serial]];
+    }
+    [argv addObjectsFromArray:@[@"shell",
+                                [commands componentsJoinedByString:@"; "]]];
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/env"];
+    task.arguments = argv;
+    task.standardOutput = NSFileHandle.fileHandleWithNullDevice;
+    task.standardError = NSFileHandle.fileHandleWithNullDevice;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    task.terminationHandler = ^(NSTask *t) {
+        dispatch_semaphore_signal(done);
+    };
+    if (![task launchAndReturnError:nil]) {
+        return;
+    }
+    if (dispatch_semaphore_wait(
+            done, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC))) {
+        [task terminate];
+    }
+}
+
+- (void)toggleKeepAwake:(id)sender {
+    BOOL on = ![self keepAwakeEnabled];
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:kKeepAwakeKey];
+    [self updateAwakeUI];
+    if (on) {
+        [self applyKeepAwake];
+    } else {
+        [self restoreKeepAwakeAsync];
+        [self flash:@"The device can lock again"];
+    }
+}
+
+- (NSMenuItem *)itemWithTitle:(NSString *)title
+                       symbol:(NSString *)symbol
+                       action:(SEL)action
+                          tag:(NSInteger)tag {
+    NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title
+                                                  action:action
+                                           keyEquivalent:@""];
+    item.target = self;
+    item.tag = tag;
+    item.image = menu_image(symbol, title);
+    return item;
+}
+
+#pragma mark - Stream quality
+
+static NSString *const kQualityKey = @"scrcpy.quality";
+
+// Keep in sync with the launcher (release/make_macos_app.sh)
+static NSString *const kQualityIds[] = {
+    @"auto", @"balanced", @"saver", @"high", @"default",
+};
+static NSString *const kQualityNames[] = {
+    @"Auto (tuned for Wi-Fi)",
+    @"Wi-Fi Balanced — 6 Mbps, up to 1600 px",
+    @"Data Saver — 3 Mbps, 30 fps",
+    @"High Quality — 16 Mbps",
+    @"scrcpy Default",
+};
+#define QUALITY_COUNT (sizeof(kQualityIds) / sizeof(kQualityIds[0]))
+
+- (NSString *)currentQuality {
+    return [[NSUserDefaults standardUserDefaults] stringForKey:kQualityKey]
+        ?: kQualityIds[0];
+}
+
+// The video settings are fixed when the session starts: restart it. The new
+// session is started by a detached helper once this one has quit, so that the
+// device settings restored on quit are not applied over the new session's.
+- (void)restartSession {
+    [self flash:@"Restarting the stream…"];
+
+    static NSString *const script =
+        @"sleep 2; exec \"$1\" ${2:+-s \"$2\"}";
+    NSTask *helper = [[NSTask alloc] init];
+    helper.executableURL = [NSURL fileURLWithPath:@"/bin/sh"];
+    helper.arguments = @[@"-c", script, @"sh", [self launcherPath],
+                         self.serial ?: @""];
+    helper.standardOutput = NSFileHandle.fileHandleWithNullDevice;
+    helper.standardError = NSFileHandle.fileHandleWithNullDevice;
+    if ([helper launchAndReturnError:nil]) {
+        [self quitCurrentSession];
+    }
+}
+
+- (void)selectQuality:(NSMenuItem *)item {
+    NSString *quality = kQualityIds[item.tag];
+    if ([quality isEqualToString:[self currentQuality]]) {
+        return;
+    }
+    [[NSUserDefaults standardUserDefaults] setObject:quality
+                                              forKey:kQualityKey];
+    [self restartSession];
+}
+
+// Maximum frame rate of the stream (the device can't go over its refresh
+// rate). "Auto" uses the one of the quality profile.
+static NSString *const kFpsKey = @"scrcpy.fps";
+static NSString *const kFpsIds[] = {@"auto", @"30", @"45", @"60", @"90", @"120"};
+static NSString *const kFpsNames[] = {
+    @"Auto (from the quality)", @"30 fps", @"45 fps", @"60 fps", @"90 fps",
+    @"120 fps",
+};
+#define FPS_COUNT (sizeof(kFpsIds) / sizeof(kFpsIds[0]))
+
+- (NSString *)currentFps {
+    return [[NSUserDefaults standardUserDefaults] stringForKey:kFpsKey]
+        ?: kFpsIds[0];
+}
+
+- (void)selectFps:(NSMenuItem *)item {
+    NSString *fps = kFpsIds[item.tag];
+    if ([fps isEqualToString:[self currentFps]]) {
+        return;
+    }
+    [[NSUserDefaults standardUserDefaults] setObject:fps forKey:kFpsKey];
+    [self restartSession];
+}
+
+- (NSMenuItem *)frameRateMenuItem {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Frame Rate"];
+    for (NSUInteger i = 0; i < FPS_COUNT; ++i) {
+        NSMenuItem *item =
+            [[NSMenuItem alloc] initWithTitle:kFpsNames[i]
+                                       action:@selector(selectFps:)
+                                keyEquivalent:@""];
+        item.target = self;
+        item.tag = i;
+        [menu addItem:item];
+        if (i == 0) {
+            [menu addItem:[NSMenuItem separatorItem]];
+        }
+    }
+    NSMenuItem *item = [self itemWithTitle:@"Frame Rate"
+                                    symbol:@"speedometer"
+                                    action:nil
+                                       tag:0];
+    item.submenu = menu;
+    return item;
+}
+
+- (NSMenu *)buildQualityMenu {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Stream Quality"];
+    for (NSUInteger i = 0; i < QUALITY_COUNT; ++i) {
+        NSMenuItem *item =
+            [[NSMenuItem alloc] initWithTitle:kQualityNames[i]
+                                       action:@selector(selectQuality:)
+                                keyEquivalent:@""];
+        item.target = self;
+        item.tag = i;
+        [menu addItem:item];
+        if (i == 0) {
+            [menu addItem:[NSMenuItem separatorItem]];
+        }
+    }
+    return menu;
+}
+
+- (NSMenuItem *)qualityMenuItem {
+    NSMenuItem *item = [self itemWithTitle:@"Stream Quality"
+                                    symbol:@"dial.medium"
+                                    action:nil
+                                       tag:0];
+    item.submenu = [self buildQualityMenu];
+    return item;
+}
+
+#pragma mark - Audio output
+
+static NSString *const kAudioKey = @"scrcpy.audio";
+// Keep in sync with the launcher (release/make_macos_app.sh)
+static NSString *const kAudioIds[] = {@"mac", @"device", @"both"};
+static NSString *const kAudioNames[] = {
+    @"Play on Mac (default)", @"Play on Device", @"Play on Mac and Device",
+};
+#define AUDIO_COUNT (sizeof(kAudioIds) / sizeof(kAudioIds[0]))
+
+- (NSString *)currentAudio {
+    return [[NSUserDefaults standardUserDefaults] stringForKey:kAudioKey]
+        ?: kAudioIds[0];
+}
+
+// The audio source is fixed when the session starts
+- (void)selectAudio:(NSMenuItem *)item {
+    NSString *audio = kAudioIds[item.tag];
+    if ([audio isEqualToString:[self currentAudio]]) {
+        return;
+    }
+    [[NSUserDefaults standardUserDefaults] setObject:audio forKey:kAudioKey];
+    [self restartSession];
+}
+
+- (NSMenuItem *)audioMenuItem {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Audio"];
+    for (NSUInteger i = 0; i < AUDIO_COUNT; ++i) {
+        NSMenuItem *item =
+            [[NSMenuItem alloc] initWithTitle:kAudioNames[i]
+                                       action:@selector(selectAudio:)
+                                keyEquivalent:@""];
+        item.target = self;
+        item.tag = i;
+        [menu addItem:item];
+    }
+    NSMenuItem *item = [self itemWithTitle:@"Audio Output"
+                                    symbol:@"speaker.wave.2"
+                                    action:nil
+                                       tag:0];
+    item.submenu = menu;
+    return item;
+}
+
+#pragma mark - Device screen off
+
+static NSString *const kScreenOffOnStartKey = @"scrcpy.screenOffOnStart";
+
+- (BOOL)screenOffOnStart {
+    return [[NSUserDefaults standardUserDefaults]
+                boolForKey:kScreenOffOnStartKey];
+}
+
+// The display of the device is off but it stays awake and controllable: the
+// clicks of the mirror still reach it. Persistent: the next sessions start so.
+- (void)toggleScreenOffOnStart:(id)sender {
+    BOOL on = ![self screenOffOnStart];
+    [[NSUserDefaults standardUserDefaults] setBool:on
+                                            forKey:kScreenOffOnStartKey];
+    self.screenOffUsed = on;
+    if (self.callback) {
+        self.callback(on ? SC_TOOLBAR_BUTTON_SCREEN_OFF
+                         : SC_TOOLBAR_BUTTON_SCREEN_ON, self.userdata);
+    }
+    [self flash:on ? @"Sessions will start with the device screen off"
+                   : @"Sessions will start with the device screen on"];
+}
+
 #pragma mark - Actions
 
 - (void)buttonClicked:(id)sender {
