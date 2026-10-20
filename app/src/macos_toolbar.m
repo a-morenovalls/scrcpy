@@ -880,6 +880,196 @@ normalized_address(NSString *input) {
     [self insertTopMenu:menu title:@"Developer"];
 }
 
+#pragma mark - Edit menu (clipboard)
+
+// Text of the Mac clipboard, if any
+- (NSString *)macClipboardText {
+    return [[NSPasteboard generalPasteboard]
+               stringForType:NSPasteboardTypeString];
+}
+
+static NSString *
+short_text(NSString *text);
+
+static NSString *
+preview_text(NSString *text) {
+    NSString *line = [[trimmed(text)
+        stringByReplacingOccurrencesOfString:@"\n" withString:@" ⏎ "]
+        stringByReplacingOccurrencesOfString:@"\t" withString:@" "];
+    return short_text(line);
+}
+
+// Paste the Mac clipboard on the device (it needs a focused text field there)
+- (void)pasteToDevice:(id)sender {
+    NSString *text = [self macClipboardText];
+    if (!trimmed(text ?: @"").length) {
+        [self flash:@"The Mac clipboard has no text to paste"];
+        return;
+    }
+    if (self.callback) {
+        self.callback(SC_TOOLBAR_BUTTON_PASTE, self.userdata);
+    }
+    [self flash:[NSString stringWithFormat:@"Pasted on the device: %@",
+                    preview_text(text)]];
+}
+
+// Type the clipboard as keystrokes (for the fields that don't accept a paste)
+- (void)typeClipboard:(id)sender {
+    NSString *text = [self macClipboardText];
+    if (!trimmed(text ?: @"").length) {
+        [self flash:@"The Mac clipboard has no text to type"];
+        return;
+    }
+    if (self.callback) {
+        self.callback(SC_TOOLBAR_BUTTON_TYPE_CLIPBOARD, self.userdata);
+    }
+    [self flash:[NSString stringWithFormat:@"Typed on the device: %@",
+                    preview_text(text)]];
+}
+
+// Copy the selection of the device to the Mac clipboard. The device answers
+// asynchronously: wait for the clipboard to change to confirm it.
+- (void)copyFromDevice:(id)sender {
+    NSPasteboard *pb = [NSPasteboard generalPasteboard];
+    NSInteger before = pb.changeCount;
+    if (self.callback) {
+        self.callback(SC_TOOLBAR_BUTTON_COPY, self.userdata);
+    }
+    [self waitForClipboardChange:before attempts:12];
+}
+
+- (void)waitForClipboardChange:(NSInteger)before attempts:(NSInteger)attempts {
+    NSPasteboard *pb = [NSPasteboard generalPasteboard];
+    if (pb.changeCount != before) {
+        NSString *text = [self macClipboardText];
+        [self flash:text.length
+            ? [NSString stringWithFormat:@"Copied from the device: %@",
+                  preview_text(text)]
+            : @"Copied from the device"];
+        return;
+    }
+    if (attempts <= 0) {
+        [self flash:@"Nothing copied: select some text on the device first"];
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        [self waitForClipboardChange:before attempts:attempts - 1];
+    });
+}
+
+// SDL only creates the application, View and Window menus. Without an Edit
+// menu, text fields (URL, pairing code...) cannot use Cmd+V/C/X/A. The standard
+// items are disabled when nothing handles them, so the Cmd+C/V shortcuts of
+// scrcpy (device clipboard) still reach the SDL view.
+- (void)installEditMenu {
+    NSMenu *main = NSApp.mainMenu;
+    if (!main || [main itemWithTitle:@"Edit"]) {
+        return;
+    }
+
+    NSMenu *edit = [[NSMenu alloc] initWithTitle:@"Edit"];
+    [edit addItemWithTitle:@"Cut" action:@selector(cut:) keyEquivalent:@"x"];
+    [edit addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
+    [edit addItemWithTitle:@"Paste" action:@selector(paste:)
+             keyEquivalent:@"v"];
+    [edit addItemWithTitle:@"Select All" action:@selector(selectAll:)
+             keyEquivalent:@"a"];
+    [edit addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem *paste = [[NSMenuItem alloc]
+        initWithTitle:@"Paste to Device"
+               action:@selector(pasteToDevice:)
+        keyEquivalent:@""];
+    paste.target = self;
+    paste.image = menu_image(@"doc.on.clipboard", @"Paste to Device");
+    [edit addItem:paste];
+
+    NSMenuItem *type = [[NSMenuItem alloc]
+        initWithTitle:@"Type Clipboard as Keystrokes"
+               action:@selector(typeClipboard:)
+        keyEquivalent:@""];
+    type.target = self;
+    type.image = menu_image(@"keyboard", @"Type Clipboard as Keystrokes");
+    [edit addItem:type];
+
+    NSMenuItem *copy = [[NSMenuItem alloc]
+        initWithTitle:@"Copy from Device"
+               action:@selector(copyFromDevice:)
+        keyEquivalent:@""];
+    copy.target = self;
+    copy.image = menu_image(@"doc.on.doc", @"Copy from Device");
+    [edit addItem:copy];
+
+    NSMenuItem *top = [[NSMenuItem alloc] initWithTitle:@"Edit"
+                                                 action:nil
+                                          keyEquivalent:@""];
+    top.submenu = edit;
+    // After the application menu
+    [main insertItem:top atIndex:MIN(1, main.numberOfItems)];
+}
+
+// Density of the device (dpi): read once, with adb
+int
+sc_macos_device_density(void) {
+    static int density;
+    if (density > 0 || !g_controller) {
+        return density;
+    }
+    NSMutableArray *argv = [NSMutableArray arrayWithObject:g_controller.adb];
+    if (g_controller.serial) {
+        [argv addObjectsFromArray:@[@"-s", g_controller.serial]];
+    }
+    [argv addObjectsFromArray:@[@"shell", @"wm density | tail -1"]];
+
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/env"];
+    task.arguments = argv;
+    NSPipe *pipe = [NSPipe pipe];
+    task.standardOutput = pipe;
+    task.standardError = NSFileHandle.fileHandleWithNullDevice;
+    if (![task launchAndReturnError:nil]) {
+        return 0;
+    }
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    task.terminationHandler = ^(NSTask *t) {
+        dispatch_semaphore_signal(done);
+    };
+    if (dispatch_semaphore_wait(
+            done, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC))) {
+        [task terminate];
+        return 0;
+    }
+    NSString *out = [[NSString alloc]
+        initWithData:[pipe.fileHandleForReading readDataToEndOfFile]
+            encoding:NSUTF8StringEncoding];
+    // "Physical density: 420" or "Override density: 320"
+    NSArray *parts = [trimmed(out) componentsSeparatedByString:@":"];
+    NSInteger value = parts.count ? [parts.lastObject integerValue] : 0;
+    density = value >= 80 && value <= 1200 ? (int) value : 0;
+    return density;
+}
+
+// Points per inch of the display of the window (from the size of the panel)
+float
+sc_macos_points_per_inch(SDL_Window *window) {
+    NSWindow *nswindow = (__bridge NSWindow *)
+        SDL_GetPointerProperty(SDL_GetWindowProperties(window),
+                               SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, NULL);
+    NSScreen *screen = nswindow.screen ?: NSScreen.mainScreen;
+    NSNumber *number = screen.deviceDescription[@"NSScreenNumber"];
+    if (number) {
+        CGSize mm = CGDisplayScreenSize((CGDirectDisplayID) number.unsignedIntValue);
+        if (mm.width > 50) {
+            float ppi = screen.frame.size.width / (mm.width / 25.4f);
+            if (ppi >= 50 && ppi <= 400) {
+                return ppi;
+            }
+        }
+    }
+    return 110.f; // typical external display
+}
+
 #pragma mark - Window menu
 
 - (void)toggleKeepOnTop:(NSMenuItem *)item {
@@ -1325,6 +1515,261 @@ static NSString *const kFpsNames[] = {
                                     action:nil
                                        tag:0];
     item.submenu = [self buildQualityMenu];
+    return item;
+}
+
+#pragma mark - Device info (copied to the Mac clipboard)
+
+// {key, title, shell command (nil: local), format}
+static NSArray<NSArray<NSString *> *> *
+info_defs(void) {
+    static NSArray *defs;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        defs = @[
+            @[@"adb_serial", @"ADB ID (the serial of adb -s)", @"", @""],
+            @[@"adb_cmd", @"ADB command (adb -s …)", @"", @""],
+            @[@"hw_serial", @"Device ID (hardware serial)", @"getprop ro.serialno", @""],
+            @[@"name", @"Name",
+              (@"n=$(settings get global device_name);"
+               @" [ -z \"$n\" -o \"$n\" = null ] && n=$(getprop ro.product.model);"
+               @" echo $n"), @""],
+            @[@"model", @"Model", @"getprop ro.product.model", @""],
+            @[@"manufacturer", @"Manufacturer",
+              @"getprop ro.product.manufacturer", @""],
+            @[@"brand", @"Brand", @"getprop ro.product.brand", @""],
+            @[@"codename", @"Codename", @"getprop ro.product.device", @""],
+            @[@"-", @"", @"", @""],
+            @[@"android", @"Android version",
+              @"getprop ro.build.version.release", @""],
+            @[@"api", @"API level", @"getprop ro.build.version.sdk", @""],
+            @[@"patch", @"Security patch",
+              @"getprop ro.build.version.security_patch", @""],
+            @[@"build", @"Build ID", @"getprop ro.build.id", @""],
+            @[@"fingerprint", @"Build fingerprint",
+              @"getprop ro.build.fingerprint", @""],
+            @[@"kernel", @"Kernel", @"uname -r", @""],
+            @[@"abi", @"CPU architecture", @"getprop ro.product.cpu.abi", @""],
+            @[@"-", @"", @"", @""],
+            @[@"resolution", @"Screen resolution",
+              @"wm size | tail -1 | sed 's/.*: //'", @""],
+            @[@"density", @"Screen density",
+              @"wm density | tail -1 | sed 's/.*: //'", @"dpi"],
+            @[@"ram", @"Memory (RAM)",
+              @"grep MemTotal /proc/meminfo | tr -s ' ' | cut -d' ' -f2", @"kb"],
+            @[@"storage", @"Storage",
+              @"df -h /data | tail -1 | tr -s ' ' | cut -d' ' -f2,3,4",
+              @"storage"],
+            @[@"battery", @"Battery level",
+              @"dumpsys battery | sed -n 's/^ *level: //p'", @"percent"],
+            @[@"ip", @"Wi-Fi IP address",
+              (@"ip -f inet addr show wlan0 | sed -n 's/.*inet \\([0-9.]*\\).*/\\1/p'"
+               @" | head -1"), @""],
+            @[@"android_id", @"Android ID",
+              @"settings get secure android_id", @""],
+            @[@"locale", @"Language",
+              (@"l=$(getprop persist.sys.locale);"
+               @" [ -z \"$l\" ] && l=$(getprop ro.product.locale); echo $l"), @""],
+            @[@"timezone", @"Time zone", @"getprop persist.sys.timezone", @""],
+        ];
+    });
+    return defs;
+}
+
+static NSString *
+format_info(NSString *raw, NSString *format) {
+    NSString *v = trimmed(raw);
+    if (!v.length || [v isEqualToString:@"null"]) {
+        return @"";
+    }
+    if ([format isEqualToString:@"kb"]) {
+        return [NSString stringWithFormat:@"%.1f GB", v.doubleValue / 1048576];
+    }
+    if ([format isEqualToString:@"percent"]) {
+        return [v stringByAppendingString:@"%"];
+    }
+    if ([format isEqualToString:@"dpi"]) {
+        return [v stringByAppendingString:@" dpi"];
+    }
+    if ([format isEqualToString:@"storage"]) {
+        NSArray *p = [v componentsSeparatedByString:@" "];
+        if (p.count == 3) {
+            return [NSString stringWithFormat:@"%@ total, %@ used, %@ free",
+                       p[0], p[1], p[2]];
+        }
+    }
+    return v;
+}
+
+- (void)copyToClipboard:(NSString *)text {
+    NSPasteboard *pb = [NSPasteboard generalPasteboard];
+    [pb clearContents];
+    [pb setString:text forType:NSPasteboardTypeString];
+}
+
+static NSString *
+short_text(NSString *text) {
+    return text.length > 48 ? [[text substringToIndex:45]
+                                  stringByAppendingString:@"…"] : text;
+}
+
+- (void)copyInfoItem:(NSMenuItem *)item {
+    NSString *key = item.representedObject;
+    for (NSArray<NSString *> *def in info_defs()) {
+        if (![def[0] isEqualToString:key]) {
+            continue;
+        }
+        NSString *title = def[1];
+        if ([key isEqualToString:@"adb_serial"]
+                || [key isEqualToString:@"adb_cmd"]) {
+            if (!self.serial) {
+                [self flash:@"The ADB ID is not known"];
+                return;
+            }
+            NSString *text = [key isEqualToString:@"adb_cmd"]
+                ? [NSString stringWithFormat:@"adb -s %@", self.serial]
+                : self.serial;
+            [self copyToClipboard:text];
+            [self flash:[NSString stringWithFormat:@"Copied %@: %@", title,
+                            short_text(text)]];
+            return;
+        }
+        [self runAdb:@[@"shell", def[2]]
+            stdoutFile:nil
+                  done:^(int status, NSString *out, NSString *err) {
+            NSString *value = status == 0 ? format_info(out, def[3]) : @"";
+            if (!value.length) {
+                [self flash:[NSString stringWithFormat:
+                                @"%@ is not available on this device", title]];
+                return;
+            }
+            [self copyToClipboard:value];
+            [self flash:[NSString stringWithFormat:@"Copied %@: %@", title,
+                            short_text(value)]];
+        }];
+        return;
+    }
+}
+
+// Every value in one adb call, copied as "Title: value" lines
+- (void)copyAllInfo:(id)sender {
+    NSMutableString *script = [NSMutableString string];
+    for (NSArray<NSString *> *def in info_defs()) {
+        if ([def[0] isEqualToString:@"-"] || !def[2].length) {
+            continue;
+        }
+        [script appendFormat:@"echo '@@%@'; { %@; } 2>/dev/null;\n", def[0],
+            def[2]];
+    }
+    [self runAdb:@[@"shell", script]
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        if (status != 0) {
+            [self flash:@"Could not read the device info"];
+            return;
+        }
+        NSMutableDictionary<NSString *, NSMutableString *> *values =
+            [NSMutableDictionary dictionary];
+        NSMutableString *current = nil;
+        for (NSString *line in [out componentsSeparatedByString:@"\n"]) {
+            if ([line hasPrefix:@"@@"]) {
+                current = [NSMutableString string];
+                values[[line substringFromIndex:2]] = current;
+            } else if (current) {
+                [current appendFormat:@"%@\n", line];
+            }
+        }
+        NSMutableArray *lines = [NSMutableArray array];
+        for (NSArray<NSString *> *def in info_defs()) {
+            NSString *key = def[0];
+            if ([key isEqualToString:@"-"]) {
+                continue;
+            }
+            NSString *value = [key isEqualToString:@"adb_serial"]
+                ? (self.serial ?: @"")
+                : [key isEqualToString:@"adb_cmd"]
+                    ? (self.serial ? [@"adb -s " stringByAppendingString:
+                                         self.serial] : @"")
+                    : format_info(values[key] ?: @"", def[3]);
+            if (value.length) {
+                [lines addObject:[NSString stringWithFormat:@"%@: %@", def[1],
+                                     value]];
+            }
+        }
+        [self copyToClipboard:[lines componentsJoinedByString:@"\n"]];
+        [self flash:[NSString stringWithFormat:@"Copied %lu device values",
+                        (unsigned long) lines.count]];
+    }];
+}
+
+- (NSMenuItem *)copyIdItemWithTitle:(NSString *)title
+                                key:(NSString *)key
+                             symbol:(NSString *)symbol {
+    NSMenuItem *item = [self itemWithTitle:title
+                                    symbol:symbol
+                                    action:@selector(copyInfoItem:)
+                                       tag:0];
+    item.representedObject = key;
+    return item;
+}
+
+// Quick access to the two identifiers
+// Install APKs and send files (also by dropping them on the window)
+- (void)addFileItemsTo:(NSMenu *)menu {
+    [menu addItem:[self itemWithTitle:@"Install APK…"
+                               symbol:@"square.and.arrow.down"
+                               action:@selector(installAPKItem:)
+                                  tag:0]];
+    [menu addItem:[self itemWithTitle:@"Send Files to Device…"
+                               symbol:@"arrow.up.doc"
+                               action:@selector(sendFilesItem:)
+                                  tag:0]];
+    [menu addItem:[self transferFolderMenuItem]];
+    [menu addItem:[self itemWithTitle:@"Open Files After Sending"
+                               symbol:@"arrow.up.forward.app"
+                               action:@selector(toggleOpenAfterSend:)
+                                  tag:0]];
+    [menu addItem:[self itemWithTitle:@"Grant Permissions When Installing"
+                               symbol:@"checkmark.shield"
+                               action:@selector(toggleGrantPermissions:)
+                                  tag:0]];
+}
+
+- (void)addCopyIdItemsTo:(NSMenu *)menu {
+    [menu addItem:[self copyIdItemWithTitle:@"Copy Device ID"
+                                        key:@"hw_serial"
+                                     symbol:@"number"]];
+    [menu addItem:[self copyIdItemWithTitle:@"Copy ADB ID"
+                                        key:@"adb_serial"
+                                     symbol:@"terminal"]];
+}
+
+- (NSMenuItem *)deviceInfoMenuItem {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Copy Device Info"];
+    for (NSArray<NSString *> *def in info_defs()) {
+        if ([def[0] isEqualToString:@"-"]) {
+            [menu addItem:[NSMenuItem separatorItem]];
+            continue;
+        }
+        NSMenuItem *item =
+            [[NSMenuItem alloc] initWithTitle:def[1]
+                                       action:@selector(copyInfoItem:)
+                                keyEquivalent:@""];
+        item.target = self;
+        item.representedObject = def[0];
+        [menu addItem:item];
+    }
+    [menu addItem:[NSMenuItem separatorItem]];
+    [menu addItem:[self itemWithTitle:@"Copy All"
+                               symbol:@"doc.on.doc"
+                               action:@selector(copyAllInfo:)
+                                  tag:0]];
+
+    NSMenuItem *item = [self itemWithTitle:@"Copy Device Info"
+                                    symbol:@"info.circle"
+                                    action:nil
+                                       tag:0];
+    item.submenu = menu;
     return item;
 }
 
