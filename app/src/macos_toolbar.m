@@ -2877,6 +2877,695 @@ mac_lan_ip(void) {
     [menu addItem:restore];
 }
 
+#pragma mark - Tool panels
+
+// The app manager and the device info stay above the simulator window (also if
+// it is kept on top), and hide when another app is in front, as the tool
+// windows of macOS do.
+- (void)configureToolPanel:(NSPanel *)panel {
+    panel.floatingPanel = YES;
+    panel.hidesOnDeactivate = YES;
+    panel.becomesKeyOnlyIfNeeded = NO;
+    panel.level = [self toolPanelLevel];
+}
+
+- (NSWindowLevel)toolPanelLevel {
+    return MAX(NSFloatingWindowLevel, self.window.level + 1);
+}
+
+// Call it when the level of the simulator window changes (Keep on Top)
+- (void)updateToolPanelLevels {
+    for (NSWindow *w in @[self.appWindow ?: [NSNull null],
+                          self.infoWindow ?: [NSNull null]]) {
+        if ([w isKindOfClass:[NSWindow class]]) {
+            w.level = [self toolPanelLevel];
+        }
+    }
+}
+
+#pragma mark - App manager
+
+// {identifier, title, symbol}
+static NSArray<NSArray<NSString *> *> *
+app_actions(void) {
+    static NSArray *actions;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        actions = @[
+            @[@"open", @"Open", @"play.circle"],
+            @[@"restart", @"Restart", @"arrow.clockwise.circle"],
+            @[@"stop", @"Force Stop", @"stop.circle"],
+            @[@"cache", @"Clear Cache", @"trash.slash"],
+            @[@"data", @"Clear Data…", @"trash"],
+            @[@"toggle", @"Disable", @"nosign"],
+            @[@"uninstall", @"Uninstall…", @"xmark.bin"],
+            @[@"info", @"App Info", @"info.circle"],
+            @[@"permissions", @"Permissions…", @"checkmark.shield"],
+            @[@"pull", @"Save APK", @"square.and.arrow.down"],
+            @[@"copy", @"Copy Package", @"doc.on.doc"],
+        ];
+    });
+    return actions;
+}
+
+// Parse "dumpsys package packages" + the list of disabled packages
+static NSArray<NSDictionary *> *
+parse_packages(NSString *out) {
+    NSArray *parts = [out componentsSeparatedByString:@"\n@@DISABLED\n"];
+    NSMutableSet *disabled = [NSMutableSet set];
+    if (parts.count > 1) {
+        for (NSString *line in [parts[1] componentsSeparatedByString:@"\n"]) {
+            NSString *l = trimmed(line);
+            if ([l hasPrefix:@"package:"]) {
+                [disabled addObject:[l substringFromIndex:8]];
+            }
+        }
+    }
+
+    NSRegularExpression *header = [NSRegularExpression
+        regularExpressionWithPattern:@"^  Package \\[([^\\]]+)\\]"
+                             options:0 error:nil];
+    NSMutableArray *result = [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
+    NSMutableDictionary *current = nil;
+    for (NSString *line in [parts[0] componentsSeparatedByString:@"\n"]) {
+        NSTextCheckingResult *m = [header firstMatchInString:line
+                                                     options:0
+                                                       range:NSMakeRange(0, line.length)];
+        if (m) {
+            NSString *package = [line substringWithRange:[m rangeAtIndex:1]];
+            if ([seen containsObject:package]) {
+                current = nil; // "Hidden system packages" repeats them
+                continue;
+            }
+            [seen addObject:package];
+            current = [NSMutableDictionary dictionaryWithDictionary:@{
+                @"package": package, @"version": @"", @"updated": @"",
+                @"installer": @"", @"system": @NO,
+                @"disabled": @([disabled containsObject:package]),
+            }];
+            [result addObject:current];
+            continue;
+        }
+        if (!current) {
+            continue;
+        }
+        NSString *t = trimmed(line);
+        if ([t hasPrefix:@"versionName="]) {
+            current[@"version"] = [t substringFromIndex:12];
+        } else if ([t hasPrefix:@"lastUpdateTime="]) {
+            current[@"updated"] = [t substringFromIndex:15];
+        } else if ([t hasPrefix:@"installerPackageName="]) {
+            current[@"installer"] = [t substringFromIndex:21];
+        } else if (([t hasPrefix:@"flags=["] || [t hasPrefix:@"pkgFlags=["])
+                   && [t containsString:@" SYSTEM"]) {
+            current[@"system"] = @YES;
+        }
+    }
+    return result;
+}
+
+- (NSDictionary *)selectedApp {
+    NSInteger row = self.appTable.selectedRow;
+    return row >= 0 && row < (NSInteger) self.shownApps.count
+        ? self.shownApps[row] : nil;
+}
+
+- (void)updateAppStatus {
+    NSDictionary *app = [self selectedApp];
+    if (self.appsLoading) {
+        self.appStatus.stringValue = @"Loading apps…";
+    } else if (app) {
+        self.appStatus.stringValue = [NSString stringWithFormat:@"%@%@",
+            app[@"package"], [app[@"disabled"] boolValue] ? @" — disabled" : @""];
+    } else {
+        self.appStatus.stringValue = [NSString stringWithFormat:
+            @"%lu apps", (unsigned long) self.shownApps.count];
+    }
+    for (NSButton *b in self.appButtons) {
+        b.enabled = app != nil;
+        if ([b.identifier isEqualToString:@"toggle"]) {
+            b.title = [app[@"disabled"] boolValue] ? @"Enable" : @"Disable";
+        }
+    }
+}
+
+- (void)applyAppFilter {
+    NSString *query = trimmed(self.appSearch.stringValue).lowercaseString;
+    BOOL system = self.appSystemCheck.state == NSControlStateValueOn;
+    NSMutableArray *list = [NSMutableArray array];
+    for (NSDictionary *app in self.apps) {
+        if (!system && [app[@"system"] boolValue]) {
+            continue;
+        }
+        if (query.length
+                && ![[app[@"package"] lowercaseString] containsString:query]) {
+            continue;
+        }
+        [list addObject:app];
+    }
+    NSArray *descriptors = self.appTable.sortDescriptors;
+    if (descriptors.count) {
+        [list sortUsingDescriptors:descriptors];
+    }
+    self.shownApps = list;
+    [self.appTable reloadData];
+    [self updateAppStatus];
+}
+
+- (void)reloadApps {
+    self.appsLoading = YES;
+    [self updateAppStatus];
+    [self runAdb:@[@"shell",
+                   (@"dumpsys package packages; echo; echo @@DISABLED;"
+                    @" pm list packages -d")]
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        self.appsLoading = NO;
+        if (status != 0) {
+            [self flash:@"Could not read the apps of the device"];
+            [self updateAppStatus];
+            return;
+        }
+        // The marker has an empty line before it
+        self.apps = parse_packages([out stringByReplacingOccurrencesOfString:
+                                       @"\n\n@@DISABLED\n"
+                                                                  withString:
+                                       @"\n@@DISABLED\n"]);
+        [self applyAppFilter];
+    }];
+}
+
+- (NSButton *)appButton:(NSArray<NSString *> *)def {
+    NSButton *b = [NSButton buttonWithTitle:def[1]
+                                     target:self
+                                     action:@selector(appButtonClicked:)];
+    b.identifier = def[0];
+    b.bezelStyle = NSBezelStyleRounded;
+    NSImage *image = menu_image(def[2], def[1]);
+    if (image) {
+        b.image = image;
+        b.imagePosition = NSImageLeading;
+    }
+    b.controlSize = NSControlSizeSmall;
+    b.enabled = NO;
+    return b;
+}
+
+- (void)buildAppManagerWindow {
+    NSPanel *w = [[NSPanel alloc]
+        initWithContentRect:NSMakeRect(0, 0, 880, 540)
+                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                          | NSWindowStyleMaskResizable
+                          | NSWindowStyleMaskMiniaturizable
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    [self configureToolPanel:w];
+    w.title = [NSString stringWithFormat:@"App Manager — %@", self.serial ?: @"device"];
+    w.releasedWhenClosed = NO;
+    w.minSize = NSMakeSize(640, 360);
+    [w setFrameAutosaveName:@"scrcpy.appManager"];
+    [w center];
+
+    NSSearchField *search = [[NSSearchField alloc] init];
+    search.placeholderString = @"Filter by package name";
+    search.delegate = self;
+    NSButton *system = [NSButton checkboxWithTitle:@"Show system apps"
+                                            target:self
+                                            action:@selector(appFilterChanged:)];
+    NSButton *refresh = [NSButton buttonWithTitle:@"Refresh"
+                                           target:self
+                                           action:@selector(refreshApps:)];
+    refresh.image = menu_image(@"arrow.clockwise", @"Refresh");
+    refresh.imagePosition = NSImageLeading;
+    NSButton *trim = [NSButton buttonWithTitle:@"Clear All Caches"
+                                        target:self
+                                        action:@selector(clearAllCaches:)];
+    trim.image = menu_image(@"trash.slash", @"Clear All Caches");
+    trim.imagePosition = NSImageLeading;
+    NSStackView *top = [NSStackView stackViewWithViews:@[search, system, refresh,
+                                                         trim]];
+    top.spacing = 12;
+    [search.widthAnchor constraintGreaterThanOrEqualToConstant:240].active = YES;
+    [search setContentHuggingPriority:NSLayoutPriorityDefaultLow
+                       forOrientation:NSLayoutConstraintOrientationHorizontal];
+
+    NSTableView *table = [[NSTableView alloc] init];
+    table.usesAlternatingRowBackgroundColors = YES;
+    table.allowsMultipleSelection = NO;
+    table.columnAutoresizingStyle = NSTableViewLastColumnOnlyAutoresizingStyle;
+    table.rowHeight = 22;
+    struct {
+        __unsafe_unretained NSString *key;
+        __unsafe_unretained NSString *title;
+        CGFloat width;
+    } cols[] = {
+        {@"package", @"Package", 330}, {@"version", @"Version", 100},
+        {@"type", @"Type", 60}, {@"updated", @"Updated", 140},
+        {@"installer", @"Installed by", 200},
+    };
+    for (size_t i = 0; i < sizeof(cols) / sizeof(cols[0]); ++i) {
+        NSTableColumn *c = [[NSTableColumn alloc]
+            initWithIdentifier:cols[i].key];
+        c.title = cols[i].title;
+        c.width = cols[i].width;
+        c.minWidth = 50;
+        NSString *sort_key = [cols[i].key isEqualToString:@"type"] ? @"system"
+                                                                   : cols[i].key;
+        c.sortDescriptorPrototype =
+            [NSSortDescriptor sortDescriptorWithKey:sort_key ascending:YES];
+        [table addTableColumn:c];
+    }
+    table.dataSource = self;
+    table.delegate = self;
+    table.target = self;
+    table.doubleAction = @selector(appDoubleClicked:);
+    NSScrollView *scroll = [[NSScrollView alloc] init];
+    scroll.documentView = table;
+    scroll.hasVerticalScroller = YES;
+    scroll.borderType = NSBezelBorder;
+
+    NSMutableArray *buttons = [NSMutableArray array];
+    for (NSArray<NSString *> *def in app_actions()) {
+        [buttons addObject:[self appButton:def]];
+    }
+    NSStackView *row1 = [NSStackView stackViewWithViews:
+        [buttons subarrayWithRange:NSMakeRange(0, 6)]];
+    NSStackView *row2 = [NSStackView stackViewWithViews:
+        [buttons subarrayWithRange:NSMakeRange(6, buttons.count - 6)]];
+    row1.spacing = row2.spacing = 8;
+    row1.distribution = row2.distribution = NSStackViewDistributionFill;
+
+    NSTextField *status = [NSTextField labelWithString:@""];
+    status.textColor = NSColor.secondaryLabelColor;
+    status.lineBreakMode = NSLineBreakByTruncatingMiddle;
+
+    NSStackView *root = [NSStackView stackViewWithViews:
+        @[top, scroll, row1, row2, status]];
+    root.orientation = NSUserInterfaceLayoutOrientationVertical;
+    root.alignment = NSLayoutAttributeLeading;
+    root.spacing = 8;
+    root.edgeInsets = NSEdgeInsetsMake(12, 12, 12, 12);
+    root.translatesAutoresizingMaskIntoConstraints = NO;
+    [w.contentView addSubview:root];
+    [NSLayoutConstraint activateConstraints:@[
+        [root.leadingAnchor constraintEqualToAnchor:w.contentView.leadingAnchor],
+        [root.trailingAnchor constraintEqualToAnchor:w.contentView.trailingAnchor],
+        [root.topAnchor constraintEqualToAnchor:w.contentView.topAnchor],
+        [root.bottomAnchor constraintEqualToAnchor:w.contentView.bottomAnchor],
+        [top.trailingAnchor constraintEqualToAnchor:root.trailingAnchor
+                                           constant:-12],
+        [scroll.trailingAnchor constraintEqualToAnchor:root.trailingAnchor
+                                              constant:-12],
+        [status.trailingAnchor constraintEqualToAnchor:root.trailingAnchor
+                                              constant:-12],
+    ]];
+    [scroll setContentHuggingPriority:NSLayoutPriorityDefaultLow - 1
+                       forOrientation:NSLayoutConstraintOrientationVertical];
+
+    self.appWindow = w;
+    self.appTable = table;
+    self.appSearch = search;
+    self.appSystemCheck = system;
+    self.appStatus = status;
+    self.appButtons = buttons;
+    table.sortDescriptors = @[[NSSortDescriptor sortDescriptorWithKey:@"package"
+                                                             ascending:YES]];
+}
+
+- (void)showAppManager:(id)sender {
+    if (!self.appWindow) {
+        [self buildAppManagerWindow];
+    }
+    [self updateToolPanelLevels];
+    [self.appWindow makeKeyAndOrderFront:nil];
+    [self reloadApps];
+}
+
+- (void)refreshApps:(id)sender {
+    [self reloadApps];
+}
+
+- (void)appFilterChanged:(id)sender {
+    [self applyAppFilter];
+}
+
+- (void)controlTextDidChange:(NSNotification *)notification {
+    [self applyAppFilter];
+}
+
+- (void)appDoubleClicked:(id)sender {
+    NSDictionary *app = [self selectedApp];
+    if (app) {
+        [self runAppAction:@"open" package:app[@"package"]];
+    }
+}
+
+- (void)appButtonClicked:(NSButton *)sender {
+    NSDictionary *app = [self selectedApp];
+    if (!app) {
+        return;
+    }
+    NSString *identifier = sender.identifier;
+    if ([identifier isEqualToString:@"toggle"]) {
+        identifier = [app[@"disabled"] boolValue] ? @"enable" : @"disable";
+    }
+    [self runAppAction:identifier package:app[@"package"]];
+}
+
+#pragma mark Table
+
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView {
+    return self.shownApps.count;
+}
+
+- (NSView *)tableView:(NSTableView *)tableView
+   viewForTableColumn:(NSTableColumn *)column
+                  row:(NSInteger)row {
+    NSTextField *cell = [tableView makeViewWithIdentifier:column.identifier
+                                                    owner:self];
+    if (!cell) {
+        cell = [NSTextField labelWithString:@""];
+        cell.identifier = column.identifier;
+        cell.lineBreakMode = NSLineBreakByTruncatingTail;
+    }
+    NSDictionary *app = self.shownApps[row];
+    NSString *value = @"";
+    if ([column.identifier isEqualToString:@"type"]) {
+        value = [app[@"system"] boolValue] ? @"System" : @"User";
+    } else {
+        value = app[column.identifier] ?: @"";
+    }
+    cell.stringValue = value;
+    cell.textColor = [app[@"disabled"] boolValue] ? NSColor.secondaryLabelColor
+                                                  : NSColor.labelColor;
+    return cell;
+}
+
+- (void)tableView:(NSTableView *)tableView
+    sortDescriptorsDidChange:(NSArray<NSSortDescriptor *> *)oldDescriptors {
+    [self applyAppFilter];
+}
+
+- (void)tableViewSelectionDidChange:(NSNotification *)notification {
+    [self updateAppStatus];
+    NSDictionary *app = [self selectedApp];
+    if (!app) {
+        return;
+    }
+    // Is it running?
+    NSString *package = app[@"package"];
+    [self runAdb:@[@"shell", [NSString stringWithFormat:@"pidof %@",
+                                 shell_quote(package)]]
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        if (![[self selectedApp][@"package"] isEqualToString:package]) {
+            return; // another row was selected meanwhile
+        }
+        NSString *pid = trimmed(out);
+        self.appStatus.stringValue = [NSString stringWithFormat:@"%@ — %@",
+            package, pid.length ? [@"running (pid " stringByAppendingFormat:
+                                      @"%@)", pid] : @"not running"];
+    }];
+}
+
+#pragma mark Actions
+
+- (void)confirm:(NSString *)message
+         detail:(NSString *)detail
+         action:(NSString *)button
+        handler:(void (^)(void))handler {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.alertStyle = NSAlertStyleWarning;
+    alert.messageText = message;
+    alert.informativeText = detail;
+    [alert addButtonWithTitle:button];
+    [alert addButtonWithTitle:@"Cancel"];
+    [alert beginSheetModalForWindow:self.appWindow ?: self.window
+                  completionHandler:^(NSModalResponse response) {
+        if (response == NSAlertFirstButtonReturn) {
+            handler();
+        }
+    }];
+}
+
+// Shell command and success message for the actions without a dialog
+- (void)runAppShell:(NSString *)command
+            success:(NSString *)message
+            refresh:(BOOL)refresh {
+    [self runAdb:@[@"shell", command]
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        NSString *text = trimmed(out.length ? out : err);
+        BOOL failed = status != 0 || [text containsString:@"Failure"]
+                   || [text hasPrefix:@"Error"];
+        [self flash:failed ? [NSString stringWithFormat:@"Failed: %@", text]
+                           : message];
+        if (refresh && !failed) {
+            [self reloadApps];
+        }
+    }];
+}
+
+- (void)openApp:(NSString *)package then:(void (^)(void))then {
+    [self runAdb:@[@"shell", [NSString stringWithFormat:
+                                 @"cmd package resolve-activity --brief %@ | tail -1",
+                                 shell_quote(package)]]
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        NSString *component = trimmed(out);
+        NSString *command = [component containsString:@"/"]
+            ? [NSString stringWithFormat:@"am start -n %@", shell_quote(component)]
+            : [NSString stringWithFormat:
+                  @"monkey -p %@ -c android.intent.category.LAUNCHER 1",
+                  shell_quote(package)];
+        [self runAdb:@[@"shell", command]
+            stdoutFile:nil
+                  done:^(int s2, NSString *o2, NSString *e2) {
+            BOOL ok = s2 == 0 && ![o2 containsString:@"Error"]
+                   && ![o2 containsString:@"No activities"];
+            [self flash:ok ? [NSString stringWithFormat:@"Opened %@", package]
+                           : [NSString stringWithFormat:
+                                 @"%@ has no screen to open", package]];
+            if (then) {
+                then();
+            }
+        }];
+    }];
+}
+
+- (void)showPermissionsOf:(NSString *)package {
+    [self runAdb:@[@"shell", [NSString stringWithFormat:
+        @"dumpsys package %@ | grep -E 'permission[.].*granted='"
+        @" | sed 's/^ *//; s/, flags=.*//'", shell_quote(package)]]
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        NSMutableString *text = [NSMutableString string];
+        for (NSString *line in [out componentsSeparatedByString:@"\n"]) {
+            NSString *l = trimmed(line);
+            if (!l.length) {
+                continue;
+            }
+            BOOL granted = [l containsString:@"granted=true"];
+            NSString *name = [[l componentsSeparatedByString:@":"] firstObject];
+            [text appendFormat:@"%@ %@\n", granted ? @"✓" : @"✗", name];
+        }
+        if (!text.length) {
+            [text appendString:@"No runtime permissions."];
+        }
+        [self flash:[NSString stringWithFormat:@"%@: %lu permissions", package,
+                        (unsigned long) [text componentsSeparatedByString:@"\n"]
+                            .count - 1]];
+        NSTextView *view = [[NSTextView alloc]
+            initWithFrame:NSMakeRect(0, 0, 520, 300)];
+        view.editable = NO;
+        view.font = [NSFont monospacedSystemFontOfSize:11
+                                                weight:NSFontWeightRegular];
+        view.string = text;
+        NSScrollView *scroll = [[NSScrollView alloc]
+            initWithFrame:NSMakeRect(0, 0, 520, 300)];
+        scroll.documentView = view;
+        scroll.hasVerticalScroller = YES;
+        scroll.borderType = NSBezelBorder;
+
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"Permissions";
+        alert.informativeText = package;
+        alert.accessoryView = scroll;
+        [alert addButtonWithTitle:@"Close"];
+        [alert beginSheetModalForWindow:self.appWindow ?: self.window
+                      completionHandler:nil];
+    }];
+}
+
+- (void)saveAPKOf:(NSString *)package {
+    [self runAdb:@[@"shell", [NSString stringWithFormat:@"pm path %@",
+                                 shell_quote(package)]]
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        NSMutableArray<NSString *> *paths = [NSMutableArray array];
+        for (NSString *line in [out componentsSeparatedByString:@"\n"]) {
+            NSString *l = trimmed(line);
+            if ([l hasPrefix:@"package:"]) {
+                [paths addObject:[l substringFromIndex:8]];
+            }
+        }
+        if (!paths.count) {
+            [self flash:@"Could not find the APK of the app"];
+            return;
+        }
+        // One APK: <package>.apk; split APKs: a folder with all of them
+        NSString *target = paths.count == 1
+            ? [self desktopPathForFile:[package stringByAppendingString:@".apk"]]
+            : [self desktopPathForFile:package];
+        if (paths.count > 1) {
+            [[NSFileManager defaultManager] createDirectoryAtPath:target
+                                      withIntermediateDirectories:YES
+                                                       attributes:nil
+                                                            error:nil];
+        }
+        [self showProgress:[NSString stringWithFormat:@"Saving %@…", package]];
+        __block NSUInteger pending = paths.count;
+        __block BOOL failed = NO;
+        for (NSString *path in paths) {
+            [self runAdb:@[@"pull", path, target]
+                stdoutFile:nil
+                      done:^(int s2, NSString *o2, NSString *e2) {
+                failed = failed || s2 != 0;
+                if (--pending == 0) {
+                    if (failed) {
+                        [self flash:@"Could not save the APK"];
+                    } else {
+                        [self flash:[NSString stringWithFormat:
+                            @"APK saved on Desktop: %@", target.lastPathComponent]];
+                        [[NSWorkspace sharedWorkspace]
+                            activateFileViewerSelectingURLs:
+                                @[[NSURL fileURLWithPath:target]]];
+                    }
+                }
+            }];
+        }
+    }];
+}
+
+// Clear the cache of one app. Android 17 leaves `pm clear --cache-only` hanging
+// when it comes from adb, so it gets a time limit; the external cache (which
+// adb can delete) is always cleared.
+- (void)clearCacheOfPackage:(NSString *)package {
+    NSString *quoted = shell_quote(package);
+    NSString *external = shell_quote([NSString stringWithFormat:
+        @"/sdcard/Android/data/%@/cache", package]);
+    NSString *script = [NSString stringWithFormat:
+        @"rm -rf %@/* 2>/dev/null;"
+        @" timeout -s KILL 3 pm clear --cache-only %@ >/dev/null 2>&1; echo $?",
+        external, quoted];
+    [self showProgress:[NSString stringWithFormat:@"Clearing the cache of %@…",
+                           package]];
+    NSTask *task = [self runAdb:@[@"shell", script]
+                     stdoutFile:nil
+                           done:^(int status, NSString *out, NSString *err) {
+        // The shell session may be closed from here (see below): the result
+        // is the exit code printed before
+        BOOL ok = [trimmed(out) isEqualToString:@"0"];
+        [self flash:ok
+            ? [NSString stringWithFormat:@"Cache of %@ cleared", package]
+            : [NSString stringWithFormat:
+                  @"External cache of %@ cleared. Android does not let adb clear"
+                  @" its internal cache: use Clear All Caches", package]];
+    }];
+    // A command killed on the device can leave the adb session open
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 7 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        if (task.isRunning) {
+            [task terminate];
+        }
+    });
+}
+
+// Every app: Android frees the caches (they are rebuilt when needed)
+- (void)clearAllCaches:(id)sender {
+    [self showProgress:@"Clearing the caches of all the apps…"];
+    [self runAdb:@[@"shell", @"timeout 90 pm trim-caches 100G; echo $?"]
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        [self flash:status == 0 && [trimmed(out) hasSuffix:@"0"]
+            ? @"Caches of all the apps cleared"
+            : @"Could not clear all the caches"];
+    }];
+}
+
+- (void)runAppAction:(NSString *)action package:(NSString *)package {
+    NSString *quoted = shell_quote(package);
+    if ([action isEqualToString:@"open"]) {
+        [self openApp:package then:nil];
+    } else if ([action isEqualToString:@"restart"]) {
+        [self runAdb:@[@"shell", [@"am force-stop " stringByAppendingString:quoted]]
+            stdoutFile:nil
+                  done:^(int status, NSString *out, NSString *err) {
+            [self openApp:package then:nil];
+        }];
+    } else if ([action isEqualToString:@"stop"]) {
+        [self runAppShell:[@"am force-stop " stringByAppendingString:quoted]
+                  success:[NSString stringWithFormat:@"Stopped %@", package]
+                  refresh:NO];
+    } else if ([action isEqualToString:@"cache"]) {
+        [self clearCacheOfPackage:package];
+    } else if ([action isEqualToString:@"cacheall"]) {
+        [self clearAllCaches:nil];
+    } else if ([action isEqualToString:@"data"]) {
+        [self confirm:[NSString stringWithFormat:@"Clear all the data of %@?",
+                          package]
+               detail:@"The app signs out and loses its settings, accounts and "
+                      @"files. This cannot be undone."
+               action:@"Clear Data"
+              handler:^{
+            [self runAppShell:[@"pm clear " stringByAppendingString:quoted]
+                      success:[NSString stringWithFormat:@"Data of %@ cleared",
+                                  package]
+                      refresh:NO];
+        }];
+    } else if ([action isEqualToString:@"disable"]
+            || [action isEqualToString:@"enable"]) {
+        BOOL disable = [action isEqualToString:@"disable"];
+        [self runAppShell:[NSString stringWithFormat:
+                              disable ? @"pm disable-user --user 0 %@"
+                                      : @"pm enable %@", quoted]
+                  success:[NSString stringWithFormat:@"%@ %@", package,
+                              disable ? @"disabled" : @"enabled"]
+                  refresh:YES];
+    } else if ([action isEqualToString:@"uninstall"]) {
+        NSDictionary *app = [self selectedApp];
+        BOOL system = [app[@"system"] boolValue];
+        [self confirm:[NSString stringWithFormat:@"Uninstall %@?", package]
+               detail:system
+                   ? @"It is a system app: it is removed for the current user "
+                     @"only (a factory reset or reinstall brings it back)."
+                   : @"The app and its data are removed from the device."
+               action:@"Uninstall"
+              handler:^{
+            [self runAppShell:[NSString stringWithFormat:
+                                  system ? @"pm uninstall --user 0 %@"
+                                         : @"pm uninstall %@", quoted]
+                      success:[NSString stringWithFormat:@"%@ uninstalled",
+                                  package]
+                      refresh:YES];
+        }];
+    } else if ([action isEqualToString:@"info"]) {
+        [self runAppShell:[NSString stringWithFormat:
+            @"am start -a android.settings.APPLICATION_DETAILS_SETTINGS"
+            @" -d package:%@", package]
+                  success:@"Opened the app info on the device"
+                  refresh:NO];
+    } else if ([action isEqualToString:@"permissions"]) {
+        [self showPermissionsOf:package];
+    } else if ([action isEqualToString:@"pull"]) {
+        [self saveAPKOf:package];
+    } else if ([action isEqualToString:@"copy"]) {
+        [self copyToClipboard:package];
+        [self flash:[NSString stringWithFormat:@"Copied: %@", package]];
+    }
+}
+
 #pragma mark - Actions
 
 - (void)buttonClicked:(id)sender {
