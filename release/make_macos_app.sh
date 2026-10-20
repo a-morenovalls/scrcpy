@@ -30,6 +30,8 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" \
 cp "$BUILD/app/scrcpy" "$APP/Contents/MacOS/scrcpy-bin"
 cp "$SERVER" "$APP/Contents/Resources/scrcpy-server"
 cp "$ROOT/app/data/disconnected.png" "$APP/Contents/Resources/"
+# Opened by the "Keyboard Shortcuts" button of the Preferences window
+cp "$ROOT/doc/macos_shortcuts.md" "$APP/Contents/Resources/"
 # The icon of the app (see release/make_icon.swift). scrcpy also uses scrcpy.png
 # as the window icon.
 sips -z 512 512 "$ROOT/app/data/macos-icon.png" \

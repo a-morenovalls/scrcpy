@@ -160,6 +160,10 @@ typedef void (^SCAdbDone)(int status, NSString *out, NSString *err);
 @property(nonatomic, copy) NSString *recordLocalPath;
 @property(nonatomic, assign) NSUInteger subtitleToken;
 @property(nonatomic, assign) BOOL screenOffUsed;
+// Preferences window
+@property(nonatomic, strong) NSWindow *prefsWindow;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSControl *> *prefControls;
+@property(nonatomic, strong) NSButton *prefsRestartButton;
 // Live device info
 @property(nonatomic, strong) NSWindow *infoWindow;
 @property(nonatomic, strong) NSTimer *infoTimer;
@@ -4887,6 +4891,409 @@ live_info_text(NSDictionary *i) {
     }
 }
 
+#pragma mark - Preferences window
+
+static NSString *const kPrefCheckboxes[][2] = {
+    // identifier, title
+    {@"keepOnTop", @"Keep the window on top of the other windows"},
+    {@"keepAwake", @"Keep the device awake while scrcpy is open"},
+    {@"screenOff", @"Start with the display of the device off"},
+    {@"restoreOnQuit", @"Undo the proxy, display and battery changes when closing"},
+    {@"openAfterSend", @"Open on the device a single file sent to it"},
+    {@"grantPermissions", @"Grant all the permissions of the apps installed by dropping them"},
+};
+
+- (NSButton *)prefCheckbox:(NSString *)identifier title:(NSString *)title {
+    NSButton *b = [NSButton checkboxWithTitle:title
+                                       target:self
+                                       action:@selector(prefChanged:)];
+    b.identifier = identifier;
+    self.prefControls[identifier] = b;
+    return b;
+}
+
+// Pop-up with the titles of the options; the represented object of each item is
+// what the preference stores
+- (NSPopUpButton *)prefPopup:(NSString *)identifier
+                      titles:(NSArray<NSString *> *)titles
+                         ids:(NSArray<NSString *> *)ids {
+    NSPopUpButton *p = [[NSPopUpButton alloc] initWithFrame:NSZeroRect
+                                                  pullsDown:NO];
+    for (NSUInteger i = 0; i < titles.count; ++i) {
+        [p addItemWithTitle:titles[i]];
+        p.lastItem.representedObject = ids[i];
+    }
+    p.identifier = identifier;
+    p.target = self;
+    p.action = @selector(prefChanged:);
+    self.prefControls[identifier] = p;
+    return p;
+}
+
+- (NSView *)prefsPage:(NSArray<NSArray *> *)rows note:(NSString *)note {
+    // rows: {label or @"", control}
+    NSMutableArray *grid_rows = [NSMutableArray array];
+    for (NSArray *row in rows) {
+        NSTextField *label = [NSTextField labelWithString:row[0]];
+        label.alignment = NSTextAlignmentRight;
+        [grid_rows addObject:@[label, row[1]]];
+    }
+    NSGridView *grid = [NSGridView gridViewWithViews:grid_rows];
+    grid.rowSpacing = 10;
+    grid.columnSpacing = 12;
+    [grid columnAtIndex:0].xPlacement = NSGridCellPlacementTrailing;
+    [grid columnAtIndex:1].xPlacement = NSGridCellPlacementLeading;
+
+    NSMutableArray *content = [NSMutableArray arrayWithObject:grid];
+    if (note.length) {
+        NSTextField *n = [NSTextField wrappingLabelWithString:note];
+        n.textColor = NSColor.secondaryLabelColor;
+        n.font = [NSFont systemFontOfSize:11];
+        [content addObject:n];
+    }
+    NSStackView *stack = [NSStackView stackViewWithViews:content];
+    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    stack.alignment = NSLayoutAttributeLeading;
+    stack.spacing = 14;
+    stack.edgeInsets = NSEdgeInsetsMake(18, 20, 18, 20);
+    return stack;
+}
+
+- (void)buildPreferencesWindow {
+    self.prefControls = [NSMutableDictionary dictionary];
+
+    // ---- General
+    NSView *general = [self prefsPage:@[
+        @[@"Window", [self prefCheckbox:kPrefCheckboxes[0][0]
+                                  title:kPrefCheckboxes[0][1]]],
+        @[@"Device", [self prefCheckbox:kPrefCheckboxes[1][0]
+                                  title:kPrefCheckboxes[1][1]]],
+        @[@"", [self prefCheckbox:kPrefCheckboxes[2][0]
+                            title:kPrefCheckboxes[2][1]]],
+        @[@"Developer", [self prefCheckbox:kPrefCheckboxes[3][0]
+                                     title:kPrefCheckboxes[3][1]]],
+    ] note:@"The device keeps its own window size and position. The screen "
+           @"timeout and the display are given back to the device when the app "
+           @"closes."];
+
+    // ---- Streaming
+    NSMutableArray *quality_ids = [NSMutableArray array];
+    NSMutableArray *quality_titles = [NSMutableArray array];
+    for (NSUInteger i = 0; i < QUALITY_COUNT; ++i) {
+        [quality_ids addObject:kQualityIds[i]];
+        [quality_titles addObject:kQualityNames[i]];
+    }
+    NSMutableArray *fps_ids = [NSMutableArray array];
+    NSMutableArray *fps_titles = [NSMutableArray array];
+    for (NSUInteger i = 0; i < FPS_COUNT; ++i) {
+        [fps_ids addObject:kFpsIds[i]];
+        [fps_titles addObject:kFpsNames[i]];
+    }
+    NSMutableArray *audio_ids = [NSMutableArray array];
+    NSMutableArray *audio_titles = [NSMutableArray array];
+    for (NSUInteger i = 0; i < AUDIO_COUNT; ++i) {
+        [audio_ids addObject:kAudioIds[i]];
+        [audio_titles addObject:kAudioNames[i]];
+    }
+    NSButton *restart = [NSButton buttonWithTitle:@"Restart Stream to Apply"
+                                           target:self
+                                           action:@selector(prefsRestartStream:)];
+    restart.enabled = NO;
+    self.prefsRestartButton = restart;
+    NSView *streaming = [self prefsPage:@[
+        @[@"Quality", [self prefPopup:@"quality" titles:quality_titles
+                                  ids:quality_ids]],
+        @[@"Frame rate", [self prefPopup:@"fps" titles:fps_titles ids:fps_ids]],
+        @[@"Audio", [self prefPopup:@"audio" titles:audio_titles ids:audio_ids]],
+        @[@"", restart],
+    ] note:@"The video and audio settings are fixed when the stream starts, so "
+           @"they apply when it restarts. Auto tunes the stream for Wi-Fi "
+           @"(H.265, constant bitrate) and leaves USB untouched."];
+
+    // ---- Files
+    NSMutableArray *folders = [NSMutableArray array];
+    NSMutableArray *folder_titles = [NSMutableArray array];
+    for (NSUInteger i = 0; i < TRANSFER_FOLDER_COUNT; ++i) {
+        [folders addObject:kTransferFolders[i]];
+        [folder_titles addObject:[@"/sdcard/" stringByAppendingString:
+                                     kTransferFolders[i]]];
+    }
+    NSView *files = [self prefsPage:@[
+        @[@"Send files to", [self prefPopup:@"transfer" titles:folder_titles
+                                        ids:folders]],
+        @[@"", [self prefCheckbox:kPrefCheckboxes[4][0]
+                            title:kPrefCheckboxes[4][1]]],
+        @[@"Installing", [self prefCheckbox:kPrefCheckboxes[5][0]
+                                      title:kPrefCheckboxes[5][1]]],
+    ] note:@"Drop APKs, APKS and XAPK files on the window to install them, and "
+           @"any other file to send it to the device."];
+
+    // ---- Device frame
+    const enum sc_frame_style order[] = {
+        SC_FRAME_NONE, SC_FRAME_PHONE_OBSIDIAN, SC_FRAME_PHONE_PORCELAIN,
+        SC_FRAME_PHONE_HAZEL, SC_FRAME_PHONE_IRIS, SC_FRAME_PHONE_PEONY,
+        SC_FRAME_PHONE_ROSE, SC_FRAME_PHONE_MINT, SC_FRAME_PHONE_BAY,
+        SC_FRAME_PHONE_JADE, SC_FRAME_PHONE_LEMONGRASS, SC_FRAME_PHONE_SNOW,
+        SC_FRAME_PHONE_CORAL, SC_FRAME_THIN,
+    };
+    NSMutableArray *frame_ids = [NSMutableArray array];
+    NSMutableArray *frame_titles = [NSMutableArray array];
+    for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); ++i) {
+        [frame_ids addObject:@(order[i]).stringValue];
+        [frame_titles addObject:kFrameNames[order[i]]];
+    }
+    NSMutableArray *shape_ids = [NSMutableArray arrayWithObject:@""];
+    NSMutableArray *shape_titles =
+        [NSMutableArray arrayWithObject:@"Auto (the model of the device)"];
+    for (int i = 0; i < sc_frame_shape_count(); ++i) {
+        [shape_ids addObject:@(sc_frame_shape_name(i))];
+        [shape_titles addObject:@(sc_frame_shape_name(i))];
+    }
+    NSView *frame = [self prefsPage:@[
+        @[@"Frame", [self prefPopup:@"frame" titles:frame_titles ids:frame_ids]],
+        @[@"Phone shape", [self prefPopup:@"shape" titles:shape_titles
+                                      ids:shape_ids]],
+    ] note:@"The frame scales with the window. With a phone frame, the buttons "
+           @"on its right side work as the volume and power buttons."];
+
+    NSArray<NSArray *> *tabs = @[
+        @[@"General", general, @"gearshape"],
+        @[@"Streaming", streaming, @"play.rectangle"],
+        @[@"Files", files, @"arrow.up.doc"],
+        @[@"Device Frame", frame, @"iphone.gen3"],
+    ];
+    NSTabView *tab_view = [[NSTabView alloc] init];
+    for (NSArray *t in tabs) {
+        NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:t[0]];
+        item.label = t[0];
+        item.view = t[1];
+        [tab_view addTabViewItem:item];
+    }
+
+    NSButton *reset = [NSButton buttonWithTitle:@"Restore Defaults"
+                                         target:self
+                                         action:@selector(prefsRestoreDefaults:)];
+    NSButton *shortcuts = [NSButton buttonWithTitle:@"Keyboard Shortcuts"
+                                             target:self
+                                             action:@selector(prefsShowShortcuts:)];
+    NSStackView *footer = [NSStackView stackViewWithViews:@[shortcuts, reset]];
+    footer.spacing = 12;
+
+    NSStackView *root = [NSStackView stackViewWithViews:@[tab_view, footer]];
+    root.orientation = NSUserInterfaceLayoutOrientationVertical;
+    root.alignment = NSLayoutAttributeTrailing;
+    root.spacing = 10;
+    root.edgeInsets = NSEdgeInsetsMake(14, 14, 14, 14);
+    root.translatesAutoresizingMaskIntoConstraints = NO;
+
+    NSWindow *w = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(0, 0, 560, 360)
+                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                          | NSWindowStyleMaskMiniaturizable
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    w.title = @"scrcpy Preferences";
+    w.releasedWhenClosed = NO;
+    w.delegate = self;
+    [w.contentView addSubview:root];
+    [NSLayoutConstraint activateConstraints:@[
+        [root.leadingAnchor constraintEqualToAnchor:w.contentView.leadingAnchor],
+        [root.trailingAnchor constraintEqualToAnchor:w.contentView.trailingAnchor],
+        [root.topAnchor constraintEqualToAnchor:w.contentView.topAnchor],
+        [root.bottomAnchor constraintEqualToAnchor:w.contentView.bottomAnchor],
+        [tab_view.widthAnchor constraintGreaterThanOrEqualToConstant:520],
+    ]];
+    [w layoutIfNeeded];
+    [w setContentSize:root.fittingSize];
+    [w setFrameAutosaveName:@"scrcpy.preferences"];
+    [w center];
+    self.prefsWindow = w;
+}
+
+static void
+select_popup_item(NSControl *control, NSString *value) {
+    NSPopUpButton *popup = (NSPopUpButton *) control;
+    for (NSMenuItem *item in popup.itemArray) {
+        if ([item.representedObject isEqualToString:value]) {
+            [popup selectItem:item];
+            return;
+        }
+    }
+}
+
+// Show the current value of every preference (they can also change from the
+// menus while the window is open)
+- (void)refreshPreferences {
+    NSDictionary<NSString *, NSControl *> *c = self.prefControls;
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    BOOL top = self.sdlWindow
+        && (SDL_GetWindowFlags(self.sdlWindow) & SDL_WINDOW_ALWAYS_ON_TOP);
+    ((NSButton *) c[@"keepOnTop"]).state = top ? NSControlStateValueOn
+                                               : NSControlStateValueOff;
+    ((NSButton *) c[@"keepAwake"]).state =
+        [self keepAwakeEnabled] ? NSControlStateValueOn : NSControlStateValueOff;
+    ((NSButton *) c[@"screenOff"]).state =
+        [self screenOffOnStart] ? NSControlStateValueOn : NSControlStateValueOff;
+    ((NSButton *) c[@"restoreOnQuit"]).state =
+        [self restoreOnQuit] ? NSControlStateValueOn : NSControlStateValueOff;
+    ((NSButton *) c[@"openAfterSend"]).state =
+        [self openAfterSend] ? NSControlStateValueOn : NSControlStateValueOff;
+    ((NSButton *) c[@"grantPermissions"]).state =
+        [self grantPermissions] ? NSControlStateValueOn : NSControlStateValueOff;
+
+    select_popup_item(c[@"quality"], [self currentQuality]);
+    select_popup_item(c[@"fps"], [self currentFps]);
+    select_popup_item(c[@"audio"], [self currentAudio]);
+    select_popup_item(c[@"transfer"], [self transferFolder]);
+    select_popup_item(c[@"frame"],
+                      @((int) sc_prefs_load_frame()).stringValue);
+    select_popup_item(c[@"shape"], [self currentShapeName]);
+    (void) defaults;
+}
+
+// Apply one preference. Used by the controls and by the tests.
+- (void)setPreference:(NSString *)identifier value:(NSString *)value {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    BOOL on = [value boolValue];
+
+    if ([identifier isEqualToString:@"keepOnTop"]) {
+        if (self.sdlWindow && SDL_SetWindowAlwaysOnTop(self.sdlWindow, on)) {
+            [defaults setBool:on forKey:kKeepOnTopDefaultsKey];
+            [self updateToolPanelLevels];
+        }
+    } else if ([identifier isEqualToString:@"keepAwake"]) {
+        if (on != [self keepAwakeEnabled]) {
+            [self toggleKeepAwake:nil];
+        }
+    } else if ([identifier isEqualToString:@"screenOff"]) {
+        if (on != [self screenOffOnStart]) {
+            [self toggleScreenOffOnStart:nil];
+        }
+    } else if ([identifier isEqualToString:@"restoreOnQuit"]) {
+        [defaults setBool:on forKey:kRestoreOnQuitKey];
+    } else if ([identifier isEqualToString:@"openAfterSend"]) {
+        [defaults setBool:on forKey:kOpenAfterSendKey];
+    } else if ([identifier isEqualToString:@"grantPermissions"]) {
+        [defaults setBool:on forKey:kGrantPermissionsKey];
+    } else if ([identifier isEqualToString:@"quality"]
+            || [identifier isEqualToString:@"fps"]
+            || [identifier isEqualToString:@"audio"]) {
+        NSString *key = [identifier isEqualToString:@"quality"] ? kQualityKey
+                      : [identifier isEqualToString:@"fps"] ? kFpsKey : kAudioKey;
+        [defaults setObject:value forKey:key];
+        self.prefsRestartButton.enabled = YES; // applies when the stream restarts
+    } else if ([identifier isEqualToString:@"transfer"]) {
+        [defaults setObject:value forKey:kTransferFolderKey];
+    } else if ([identifier isEqualToString:@"frame"]) {
+        enum sc_frame_style style = (enum sc_frame_style) value.intValue;
+        [defaults setInteger:style forKey:kFrameStyleKey];
+        if (self.frameCallback) {
+            self.frameCallback(style, self.userdata);
+        }
+    } else if ([identifier isEqualToString:@"shape"]) {
+        int shape = -1;
+        for (int i = 0; i < sc_frame_shape_count(); ++i) {
+            if ([value isEqualToString:@(sc_frame_shape_name(i))]) {
+                shape = i;
+            }
+        }
+        if (shape < 0) {
+            [defaults removeObjectForKey:kFrameShapeKey];
+        } else {
+            [defaults setObject:value forKey:kFrameShapeKey];
+        }
+        if (self.shapeCallback) {
+            self.shapeCallback(shape, self.userdata);
+        }
+    }
+}
+
+- (void)prefChanged:(NSControl *)sender {
+    NSString *value;
+    if ([sender isKindOfClass:[NSPopUpButton class]]) {
+        value = ((NSPopUpButton *) sender).selectedItem.representedObject;
+    } else {
+        value = ((NSButton *) sender).state == NSControlStateValueOn ? @"1" : @"0";
+    }
+    [self setPreference:sender.identifier value:value];
+    [self refreshPreferences];
+}
+
+- (void)prefsRestartStream:(id)sender {
+    self.prefsRestartButton.enabled = NO;
+    [self restartSession];
+}
+
+- (void)prefsShowShortcuts:(id)sender {
+    // The reference of the shortcuts is in the repository
+    NSString *path = [NSBundle.mainBundle.resourcePath
+        stringByAppendingPathComponent:@"macos_shortcuts.md"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:path]];
+    } else {
+        [self flash:@"The shortcuts are listed in the menus and in "
+                    @"doc/macos_shortcuts.md"];
+    }
+}
+
+- (void)prefsRestoreDefaults:(id)sender {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.alertStyle = NSAlertStyleWarning;
+    alert.messageText = @"Restore the default preferences?";
+    alert.informativeText = @"The window size and position of each device are kept.";
+    [alert addButtonWithTitle:@"Restore Defaults"];
+    [alert addButtonWithTitle:@"Cancel"];
+    [alert beginSheetModalForWindow:self.prefsWindow
+                  completionHandler:^(NSModalResponse response) {
+        if (response == NSAlertFirstButtonReturn) {
+            [self restoreDefaultPreferences];
+        }
+    }];
+}
+
+- (void)restoreDefaultPreferences {
+    // Live ones first, then the stored values
+    [self setPreference:@"keepOnTop" value:@"0"];
+    [self setPreference:@"keepAwake" value:@"0"];
+    [self setPreference:@"screenOff" value:@"0"];
+    [self setPreference:@"frame" value:@(SC_FRAME_NONE).stringValue];
+    [self setPreference:@"shape" value:@""];
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    for (NSString *key in @[kQualityKey, kFpsKey, kAudioKey, kTransferFolderKey,
+                            kOpenAfterSendKey, kGrantPermissionsKey,
+                            kRestoreOnQuitKey]) {
+        [defaults removeObjectForKey:key];
+    }
+    self.prefsRestartButton.enabled = YES;
+    [self refreshPreferences];
+    [self flash:@"Preferences restored"];
+}
+
+- (void)showPreferences:(id)sender {
+    if (!self.prefsWindow) {
+        [self buildPreferencesWindow];
+    }
+    [self refreshPreferences];
+    [self.prefsWindow makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+}
+
+// The "Settings…" item that SDL puts in the application menu opens the window
+- (void)installPreferencesMenuItem {
+    NSMenu *app_menu = NSApp.mainMenu.itemArray.firstObject.submenu;
+    NSMenuItem *item = [app_menu itemWithTitle:@"Settings…"];
+    if (!item) {
+        item = [[NSMenuItem alloc] initWithTitle:@"Preferences…"
+                                          action:nil
+                                   keyEquivalent:@","];
+        item.keyEquivalentModifierMask = NSEventModifierFlagCommand;
+        [app_menu insertItem:item atIndex:MIN(1, (NSInteger) app_menu.numberOfItems)];
+    }
+    item.target = self;
+    item.action = @selector(showPreferences:);
+    item.enabled = YES;
+}
+
 #pragma mark - Actions
 
 - (void)buttonClicked:(id)sender {
@@ -5907,6 +6314,7 @@ sc_macos_toolbar_init(SDL_Window *window, sc_toolbar_callback callback,
     g_controller.window = nswindow;
     g_controller.sdlWindow = window;
     [g_controller installEditMenu];
+    [g_controller installPreferencesMenuItem];
     [g_controller installDeviceMenu];
     [g_controller installDeveloperMenu];
     [g_controller installViewMenuItems];
@@ -5951,6 +6359,54 @@ sc_macos_toolbar_init(SDL_Window *window, sc_toolbar_callback callback,
                           relativeTo:nil];
     g_controller.dropOverlay = overlay;
     g_controller.dropLabel = label;
+
+    // Debug: SCRCPY_TEST_PREFS="show@8,keepOnTop=1@9,quality=saver@10,report@20"
+    // changes the preferences like the window controls do
+    const char *test_prefs = getenv("SCRCPY_TEST_PREFS");
+    if (test_prefs) {
+        for (NSString *entry in [@(test_prefs) componentsSeparatedByString:@","]) {
+            NSArray *parts = [entry componentsSeparatedByString:@"@"];
+            if (parts.count != 2) {
+                continue;
+            }
+            NSString *name = parts[0];
+            dispatch_after(
+                dispatch_time(DISPATCH_TIME_NOW,
+                              (int64_t) ([parts[1] doubleValue] * NSEC_PER_SEC)),
+                dispatch_get_main_queue(), ^{
+                if ([name isEqualToString:@"show"]) {
+                    [g_controller showPreferences:nil];
+                } else if ([name isEqualToString:@"defaults"]) {
+                    [g_controller restoreDefaultPreferences];
+                } else if ([name isEqualToString:@"report"]) {
+                    [g_controller refreshPreferences];
+                    NSMutableString *r = [NSMutableString string];
+                    for (NSString *key in @[@"keepOnTop", @"keepAwake",
+                                            @"screenOff", @"restoreOnQuit",
+                                            @"openAfterSend", @"grantPermissions"]) {
+                        [r appendFormat:@"%@=%ld ", key, (long)
+                            ((NSButton *) g_controller.prefControls[key]).state];
+                    }
+                    for (NSString *key in @[@"quality", @"fps", @"audio",
+                                            @"transfer", @"frame", @"shape"]) {
+                        NSPopUpButton *p = (NSPopUpButton *) g_controller.prefControls[key];
+                        [r appendFormat:@"%@=%@ ", key,
+                            p.selectedItem.title ?: @"?"];
+                    }
+                    [r appendFormat:@"restartEnabled=%d sdlTop=%d",
+                        g_controller.prefsRestartButton.enabled,
+                        (int) ((SDL_GetWindowFlags(g_controller.sdlWindow)
+                                & SDL_WINDOW_ALWAYS_ON_TOP) != 0)];
+                    [g_controller flash:r];
+                } else {
+                    NSArray *kv = [name componentsSeparatedByString:@"="];
+                    if (kv.count == 2) {
+                        [g_controller setPreference:kv[0] value:kv[1]];
+                    }
+                }
+            });
+        }
+    }
 
     // Debug: SCRCPY_TEST_INFO="show@8,report@14" opens the panel and logs it
     const char *test_info = getenv("SCRCPY_TEST_INFO");
