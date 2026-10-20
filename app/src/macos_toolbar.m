@@ -42,6 +42,104 @@ static const NSTimeInterval kSubtitleDuration = 4.0;
 
 typedef void (^SCAdbDone)(int status, NSString *out, NSString *err);
 
+// Horizontal bar (battery, memory, storage) with a color that follows the value
+@interface SCBarView : NSView
+@property(nonatomic, assign) double fraction;
+@property(nonatomic, strong) NSColor *color;
+@end
+
+@implementation SCBarView
+
+- (void)setFraction:(double)fraction {
+    _fraction = MAX(0, MIN(1, fraction));
+    self.needsDisplay = YES;
+}
+
+- (void)setColor:(NSColor *)color {
+    _color = color;
+    self.needsDisplay = YES;
+}
+
+- (NSSize)intrinsicContentSize {
+    return NSMakeSize(NSViewNoIntrinsicMetric, 10);
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    NSRect r = NSInsetRect(self.bounds, 0, 1);
+    CGFloat radius = r.size.height / 2;
+    [[NSColor.quaternaryLabelColor colorWithAlphaComponent:0.35] setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:r xRadius:radius yRadius:radius]
+        fill];
+    NSRect fill = r;
+    fill.size.width = MAX(r.size.height, r.size.width * self.fraction);
+    [(self.color ?: NSColor.controlAccentColor) setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:fill xRadius:radius yRadius:radius]
+        fill];
+}
+
+@end
+
+// Line chart of the last values
+@interface SCSparkView : NSView
+@property(nonatomic, strong) NSArray<NSNumber *> *values;
+@property(nonatomic, strong) NSColor *color;
+@end
+
+@implementation SCSparkView
+
+- (void)setValues:(NSArray<NSNumber *> *)values {
+    _values = values;
+    self.needsDisplay = YES;
+}
+
+- (NSSize)intrinsicContentSize {
+    return NSMakeSize(NSViewNoIntrinsicMetric, 34);
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    NSRect r = NSInsetRect(self.bounds, 1, 3);
+    if (self.values.count < 2) {
+        return;
+    }
+    double lo = INFINITY, hi = -INFINITY;
+    for (NSNumber *n in self.values) {
+        lo = MIN(lo, n.doubleValue);
+        hi = MAX(hi, n.doubleValue);
+    }
+    if (hi - lo < 1) { // a flat line in the middle
+        double mid = (hi + lo) / 2;
+        lo = mid - 0.5;
+        hi = mid + 0.5;
+    }
+    NSColor *color = self.color ?: NSColor.controlAccentColor;
+    NSBezierPath *line = [NSBezierPath bezierPath];
+    NSBezierPath *area = [NSBezierPath bezierPath];
+    NSUInteger count = self.values.count;
+    for (NSUInteger i = 0; i < count; ++i) {
+        CGFloat x = r.origin.x + r.size.width * i / (count - 1);
+        CGFloat y = r.origin.y
+                  + r.size.height * ([self.values[i] doubleValue] - lo) / (hi - lo);
+        if (i == 0) {
+            [line moveToPoint:NSMakePoint(x, y)];
+            [area moveToPoint:NSMakePoint(x, r.origin.y)];
+            [area lineToPoint:NSMakePoint(x, y)];
+        } else {
+            [line lineToPoint:NSMakePoint(x, y)];
+            [area lineToPoint:NSMakePoint(x, y)];
+        }
+    }
+    [area lineToPoint:NSMakePoint(r.origin.x + r.size.width, r.origin.y)];
+    [area closePath];
+    [[color colorWithAlphaComponent:0.18] setFill];
+    [area fill];
+    [color setStroke];
+    line.lineWidth = 1.5;
+    line.lineJoinStyle = NSLineJoinStyleRound;
+    [line stroke];
+}
+
+@end
+
 @interface SCController : NSObject <NSToolbarDelegate, NSTableViewDataSource,
                                     NSTableViewDelegate, NSSearchFieldDelegate,
                                     NSWindowDelegate>
@@ -3563,6 +3661,571 @@ parse_packages(NSString *out) {
     } else if ([action isEqualToString:@"copy"]) {
         [self copyToClipboard:package];
         [self flash:[NSString stringWithFormat:@"Copied: %@", package]];
+    }
+}
+
+#pragma mark - Live device info
+
+static NSString *const kLiveInfoScript =
+    @"echo '@@battery'; dumpsys battery;"
+    @" echo '@@mem'; grep -E 'MemTotal|MemAvailable|SwapTotal|SwapFree'"
+    @" /proc/meminfo;"
+    @" echo '@@df'; df /data | tail -1;"
+    @" echo '@@focus'; dumpsys activity activities 2>/dev/null"
+    @" | grep -m1 topResumedActivity;"
+    @" echo '@@focus2'; dumpsys window 2>/dev/null | grep -m1 mCurrentFocus;"
+    @" echo '@@wifi'; dumpsys wifi 2>/dev/null | grep -m1 mWifiInfo;"
+    @" echo '@@load'; cat /proc/loadavg;"
+    @" echo '@@uptime'; cat /proc/uptime;"
+    @" echo '@@thermal'; dumpsys thermalservice 2>/dev/null"
+    @" | grep -E 'Temperature[{]mValue|Thermal Status' | head -24;"
+    @" echo '@@power'; dumpsys power 2>/dev/null | grep -m1 'mWakefulness=';"
+    @" echo '@@end'";
+
+static NSString *
+format_bytes_kb(double kb) {
+    double gb = kb / 1048576.0;
+    return gb >= 1 ? [NSString stringWithFormat:@"%.1f GB", gb]
+                   : [NSString stringWithFormat:@"%.0f MB", kb / 1024.0];
+}
+
+static NSString *
+first_match(NSString *text, NSString *pattern) {
+    NSRegularExpression *re = [NSRegularExpression
+        regularExpressionWithPattern:pattern options:0 error:nil];
+    NSTextCheckingResult *m = [re firstMatchInString:text
+                                             options:0
+                                               range:NSMakeRange(0, text.length)];
+    return m && m.numberOfRanges > 1 ? [text substringWithRange:[m rangeAtIndex:1]]
+                                     : nil;
+}
+
+// Split the output of kLiveInfoScript in sections and read the values
+static NSDictionary<NSString *, id> *
+parse_live_info(NSString *out) {
+    NSMutableDictionary *sections = [NSMutableDictionary dictionary];
+    NSString *current = nil;
+    NSMutableString *buffer = nil;
+    for (NSString *line in [out componentsSeparatedByString:@"\n"]) {
+        if ([line hasPrefix:@"@@"]) {
+            current = [line substringFromIndex:2];
+            buffer = [NSMutableString string];
+            sections[current] = buffer;
+        } else if (buffer) {
+            [buffer appendFormat:@"%@\n", line];
+        }
+    }
+
+    NSMutableDictionary *info = [NSMutableDictionary dictionary];
+
+    NSString *battery = sections[@"battery"] ?: @"";
+    NSString *level = first_match(battery, @"\n\\s*level: (\\d+)");
+    NSString *temp = first_match(battery, @"\n\\s*temperature: (-?\\d+)");
+    NSString *status = first_match(battery, @"\n\\s*status: (\\d+)");
+    NSString *health = first_match(battery, @"\n\\s*health: (\\d+)");
+    NSString *voltage = first_match(battery, @"\n\\s*voltage: (\\d+)");
+    if (level) { info[@"level"] = @(level.intValue); }
+    if (temp) { info[@"batteryTemp"] = @(temp.doubleValue / 10.0); }
+    if (voltage) { info[@"voltage"] = @(voltage.doubleValue / 1000.0); }
+    NSArray *statuses = @[@"Unknown", @"Unknown", @"Charging", @"Discharging",
+                          @"Not charging", @"Full"];
+    NSInteger st = status.integerValue;
+    info[@"status"] = st >= 0 && st < (NSInteger) statuses.count ? statuses[st]
+                                                                  : @"Unknown";
+    NSArray *healths = @[@"Unknown", @"Unknown", @"Good", @"Overheated", @"Dead",
+                         @"Over voltage", @"Failure", @"Cold"];
+    NSInteger h = health.integerValue;
+    info[@"health"] = h >= 0 && h < (NSInteger) healths.count ? healths[h]
+                                                               : @"Unknown";
+    NSMutableArray *power = [NSMutableArray array];
+    if ([battery containsString:@"AC powered: true"]) { [power addObject:@"AC"]; }
+    if ([battery containsString:@"USB powered: true"]) { [power addObject:@"USB"]; }
+    if ([battery containsString:@"Wireless powered: true"]) {
+        [power addObject:@"Wireless"];
+    }
+    info[@"plugged"] = [power componentsJoinedByString:@" + "];
+
+    NSString *mem = sections[@"mem"] ?: @"";
+    for (NSString *key in @[@"MemTotal", @"MemAvailable", @"SwapTotal",
+                            @"SwapFree"]) {
+        NSString *v = first_match(mem, [NSString stringWithFormat:
+                                           @"%@:\\s+(\\d+) kB", key]);
+        if (v) { info[key] = @(v.doubleValue); }
+    }
+
+    NSString *df = trimmed(sections[@"df"] ?: @"");
+    NSArray *cols = [[df componentsSeparatedByString:@" "]
+        filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]];
+    if (cols.count >= 4) {
+        info[@"dfTotal"] = @([cols[1] doubleValue]);
+        info[@"dfUsed"] = @([cols[2] doubleValue]);
+        info[@"dfAvail"] = @([cols[3] doubleValue]);
+    }
+
+    NSString *focus = sections[@"focus"] ?: @"";
+    NSString *package = nil, *activity = nil;
+    NSRegularExpression *re = [NSRegularExpression
+        regularExpressionWithPattern:@"u0 ([A-Za-z0-9_.]+)/([A-Za-z0-9_.$]+)"
+                             options:0 error:nil];
+    NSTextCheckingResult *m = [re firstMatchInString:focus options:0
+                                               range:NSMakeRange(0, focus.length)];
+    if (m) {
+        package = [focus substringWithRange:[m rangeAtIndex:1]];
+        activity = [focus substringWithRange:[m rangeAtIndex:2]];
+    } else {
+        NSString *f2 = sections[@"focus2"] ?: @"";
+        m = [re firstMatchInString:f2 options:0 range:NSMakeRange(0, f2.length)];
+        if (m) {
+            package = [f2 substringWithRange:[m rangeAtIndex:1]];
+            activity = [f2 substringWithRange:[m rangeAtIndex:2]];
+        }
+    }
+    if (package) { info[@"package"] = package; }
+    if (activity) { info[@"activity"] = activity; }
+
+    NSString *wifi = sections[@"wifi"] ?: @"";
+    NSString *ssid = first_match(wifi, @"SSID: \"([^\"]*)\"");
+    if (ssid) { info[@"ssid"] = ssid; }
+    NSString *rssi = first_match(wifi, @"RSSI: (-?\\d+)");
+    if (rssi) { info[@"rssi"] = @(rssi.intValue); }
+    NSString *speed = first_match(wifi, @"Link speed: (\\d+)Mbps");
+    if (speed) { info[@"linkSpeed"] = @(speed.intValue); }
+    NSString *std = first_match(wifi, @"Wi-Fi standard: (\\w+)");
+    if (std) { info[@"wifiStandard"] = std; }
+    NSString *freq = first_match(wifi, @"Frequency: (\\d+)MHz");
+    if (freq) { info[@"frequency"] = @(freq.intValue); }
+
+    NSArray *load = [trimmed(sections[@"load"] ?: @"")
+        componentsSeparatedByString:@" "];
+    if (load.count >= 3) {
+        info[@"load"] = [NSString stringWithFormat:@"%@ · %@ · %@", load[0],
+                            load[1], load[2]];
+    }
+    NSString *up = first_match(sections[@"uptime"] ?: @"", @"^\\s*([0-9.]+)");
+    if (up) { info[@"uptime"] = @(up.doubleValue); }
+    info[@"awake"] = [(sections[@"power"] ?: @"") containsString:@"Awake"]
+        ? @"Awake" : ([(sections[@"power"] ?: @"") containsString:@"Dozing"]
+                          ? @"Screen off" : @"");
+
+    // Thermal sensors of the SoC
+    NSString *thermal = sections[@"thermal"] ?: @"";
+    NSString *tstatus = first_match(thermal, @"Thermal Status: (\\d+)");
+    NSArray *tnames = @[@"None", @"Light", @"Moderate", @"Severe", @"Critical",
+                        @"Emergency", @"Shutdown"];
+    NSInteger ts = tstatus.integerValue;
+    info[@"thermalStatus"] = ts >= 0 && ts < (NSInteger) tnames.count
+        ? tnames[ts] : @"Unknown";
+    NSRegularExpression *tre = [NSRegularExpression
+        regularExpressionWithPattern:@"mValue=([0-9.]+), mType=(-?\\d+), mName=([^,]+),"
+                             options:0 error:nil];
+    double cpu = 0, soc = 0, disp = 0, skin = 0;
+    for (NSTextCheckingResult *t in [tre matchesInString:thermal options:0
+                                                  range:NSMakeRange(0, thermal.length)]) {
+        double value = [[thermal substringWithRange:[t rangeAtIndex:1]] doubleValue];
+        NSInteger type = [[thermal substringWithRange:[t rangeAtIndex:2]] integerValue];
+        NSString *name = [thermal substringWithRange:[t rangeAtIndex:3]];
+        if (value <= 0) { continue; }
+        if (type == 0) { cpu = MAX(cpu, value); }
+        else if ([name isEqualToString:@"soc_therm"]) { soc = value; }
+        else if ([name isEqualToString:@"disp_therm"]) { disp = value; }
+        else if ([name.uppercaseString containsString:@"SKIN"]) { skin = MAX(skin, value); }
+    }
+    if (cpu) { info[@"cpuTemp"] = @(cpu); }
+    if (soc) { info[@"socTemp"] = @(soc); }
+    if (disp) { info[@"dispTemp"] = @(disp); }
+    if (skin) { info[@"skinTemp"] = @(skin); }
+    return info;
+}
+
+static NSString *
+format_uptime(double seconds) {
+    long s = (long) seconds;
+    long d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60;
+    return d ? [NSString stringWithFormat:@"%ldd %ldh %ldm", d, h, m]
+             : [NSString stringWithFormat:@"%ldh %ldm", h, m];
+}
+
+static NSString *
+signal_quality(int rssi) {
+    return rssi >= -55 ? @"Excellent" : rssi >= -67 ? @"Good"
+         : rssi >= -75 ? @"Fair" : @"Weak";
+}
+
+static NSColor *
+temperature_color(double c) {
+    return c >= 45 ? NSColor.systemRedColor
+         : c >= 40 ? NSColor.systemOrangeColor : NSColor.systemGreenColor;
+}
+
+// Plain text of the info, for the clipboard and the tests
+static NSString *
+live_info_text(NSDictionary *i) {
+    NSMutableArray *lines = [NSMutableArray array];
+    if (i[@"level"]) {
+        [lines addObject:[NSString stringWithFormat:
+            @"Battery: %@%% · %@%@ · %.1f °C · %.2f V · %@", i[@"level"],
+            i[@"status"], [i[@"plugged"] length]
+                ? [NSString stringWithFormat:@" (%@)", i[@"plugged"]] : @"",
+            [i[@"batteryTemp"] doubleValue], [i[@"voltage"] doubleValue],
+            i[@"health"]]];
+    }
+    if (i[@"MemTotal"]) {
+        [lines addObject:[NSString stringWithFormat:
+            @"Memory: %@ free of %@ (swap %@ free of %@)",
+            format_bytes_kb([i[@"MemAvailable"] doubleValue]),
+            format_bytes_kb([i[@"MemTotal"] doubleValue]),
+            format_bytes_kb([i[@"SwapFree"] doubleValue]),
+            format_bytes_kb([i[@"SwapTotal"] doubleValue])]];
+    }
+    if (i[@"dfTotal"]) {
+        [lines addObject:[NSString stringWithFormat:
+            @"Storage: %@ free of %@", format_bytes_kb([i[@"dfAvail"] doubleValue]),
+            format_bytes_kb([i[@"dfTotal"] doubleValue])]];
+    }
+    if (i[@"package"]) {
+        [lines addObject:[NSString stringWithFormat:@"Foreground: %@/%@",
+            i[@"package"], i[@"activity"]]];
+    }
+    if (i[@"ssid"]) {
+        [lines addObject:[NSString stringWithFormat:
+            @"Wi-Fi: %@ · %@ dBm (%@) · %@ Mbps · %@ · %@ MHz", i[@"ssid"],
+            i[@"rssi"], signal_quality([i[@"rssi"] intValue]), i[@"linkSpeed"],
+            i[@"wifiStandard"] ?: @"", i[@"frequency"] ?: @"?"]];
+    }
+    [lines addObject:[NSString stringWithFormat:
+        @"Thermal: %@ · CPU %.1f °C · SoC %.1f °C · Display %.1f °C · Skin %.1f °C",
+        i[@"thermalStatus"], [i[@"cpuTemp"] doubleValue],
+        [i[@"socTemp"] doubleValue], [i[@"dispTemp"] doubleValue],
+        [i[@"skinTemp"] doubleValue]]];
+    if (i[@"load"]) {
+        [lines addObject:[NSString stringWithFormat:@"Load average: %@", i[@"load"]]];
+    }
+    if (i[@"uptime"]) {
+        [lines addObject:[NSString stringWithFormat:@"Uptime: %@",
+            format_uptime([i[@"uptime"] doubleValue])]];
+    }
+    return [lines componentsJoinedByString:@"\n"];
+}
+
+- (NSTextField *)infoLabel:(NSString *)text bold:(BOOL)bold {
+    NSTextField *l = [NSTextField labelWithString:text];
+    l.font = bold ? [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
+                  : [NSFont systemFontOfSize:12];
+    l.textColor = bold ? NSColor.labelColor : NSColor.secondaryLabelColor;
+    l.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    l.maximumNumberOfLines = 1;
+    return l;
+}
+
+- (NSStackView *)infoSection:(NSString *)title
+                      symbol:(NSString *)symbol
+                       views:(NSArray<NSView *> *)views {
+    NSTextField *header = [self infoLabel:title bold:YES];
+    NSImageView *icon = [NSImageView imageViewWithImage:
+        menu_image(symbol, title) ?: [NSImage imageNamed:NSImageNameInfo]];
+    icon.contentTintColor = NSColor.controlAccentColor;
+    NSStackView *head = [NSStackView stackViewWithViews:@[icon, header]];
+    head.spacing = 6;
+    NSMutableArray *all = [NSMutableArray arrayWithObject:head];
+    [all addObjectsFromArray:views];
+    NSStackView *section = [NSStackView stackViewWithViews:all];
+    section.orientation = NSUserInterfaceLayoutOrientationVertical;
+    section.alignment = NSLayoutAttributeLeading;
+    section.spacing = 4;
+    return section;
+}
+
+- (void)buildDeviceInfoWindow {
+    NSPanel *w = [[NSPanel alloc]
+        initWithContentRect:NSMakeRect(0, 0, 400, 620)
+                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                          | NSWindowStyleMaskMiniaturizable
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    [self configureToolPanel:w];
+    w.title = [NSString stringWithFormat:@"Device Info — %@",
+                  self.serial ?: @"device"];
+    w.releasedWhenClosed = NO;
+    w.delegate = self;
+    [w setFrameAutosaveName:@"scrcpy.deviceInfo"];
+
+    NSMutableDictionary *labels = [NSMutableDictionary dictionary];
+    NSTextField *(^value)(NSString *) = ^NSTextField *(NSString *key) {
+        NSTextField *l = [self infoLabel:@"—" bold:NO];
+        labels[key] = l;
+        return l;
+    };
+    SCBarView *(^bar)(NSString *) = ^SCBarView *(NSString *key) {
+        SCBarView *b = [[SCBarView alloc] init];
+        labels[key] = b;
+        return b;
+    };
+    SCSparkView *(^spark)(NSString *) = ^SCSparkView *(NSString *key) {
+        SCSparkView *v = [[SCSparkView alloc] init];
+        labels[key] = v;
+        return v;
+    };
+    NSTextField *(^big)(NSString *) = ^NSTextField *(NSString *key) {
+        NSTextField *l = [NSTextField labelWithString:@"—"];
+        l.font = [NSFont monospacedDigitSystemFontOfSize:26
+                                                  weight:NSFontWeightSemibold];
+        labels[key] = l;
+        return l;
+    };
+
+    NSArray<NSView *> *sections = @[
+        [self infoSection:@"Battery" symbol:@"battery.100" views:@[
+            big(@"batteryBig"), bar(@"batteryBar"), value(@"batteryLine"),
+            value(@"batteryLine2"), spark(@"tempSpark")]],
+        [self infoSection:@"Memory" symbol:@"memorychip" views:@[
+            value(@"memLine"), bar(@"memBar"), value(@"swapLine"),
+            spark(@"memSpark")]],
+        [self infoSection:@"Storage" symbol:@"internaldrive" views:@[
+            value(@"dfLine"), bar(@"dfBar")]],
+        [self infoSection:@"Temperatures" symbol:@"thermometer.medium" views:@[
+            value(@"thermalLine"), value(@"thermalLine2")]],
+        [self infoSection:@"Wi-Fi" symbol:@"wifi" views:@[
+            value(@"wifiLine"), value(@"wifiLine2")]],
+        [self infoSection:@"Foreground app" symbol:@"app.badge" views:@[
+            value(@"focusLine"), value(@"focusLine2")]],
+        [self infoSection:@"System" symbol:@"cpu" views:@[
+            value(@"loadLine"), value(@"uptimeLine")]],
+    ];
+
+    NSButton *live = [NSButton checkboxWithTitle:@"Live (every 3 s)"
+                                          target:self
+                                          action:@selector(infoLiveChanged:)];
+    live.state = NSControlStateValueOn;
+    NSButton *copy = [NSButton buttonWithTitle:@"Copy"
+                                        target:self
+                                        action:@selector(copyDeviceInfoText:)];
+    copy.image = menu_image(@"doc.on.doc", @"Copy");
+    copy.imagePosition = NSImageLeading;
+    NSButton *refresh = [NSButton buttonWithTitle:@"Refresh"
+                                           target:self
+                                           action:@selector(refreshDeviceInfo)];
+    NSStackView *footer = [NSStackView stackViewWithViews:@[live, copy, refresh]];
+    footer.spacing = 12;
+
+    NSMutableArray *rows = [NSMutableArray arrayWithArray:sections];
+    [rows addObject:footer];
+    NSStackView *root = [NSStackView stackViewWithViews:rows];
+    root.orientation = NSUserInterfaceLayoutOrientationVertical;
+    root.alignment = NSLayoutAttributeLeading;
+    root.spacing = 14;
+    root.edgeInsets = NSEdgeInsetsMake(16, 18, 16, 18);
+    root.translatesAutoresizingMaskIntoConstraints = NO;
+    [w.contentView addSubview:root];
+    [NSLayoutConstraint activateConstraints:@[
+        [root.leadingAnchor constraintEqualToAnchor:w.contentView.leadingAnchor],
+        [root.trailingAnchor constraintEqualToAnchor:w.contentView.trailingAnchor],
+        [root.topAnchor constraintEqualToAnchor:w.contentView.topAnchor],
+        [root.bottomAnchor constraintLessThanOrEqualToAnchor:
+            w.contentView.bottomAnchor],
+    ]];
+    // Bars and charts use the whole width
+    for (NSString *key in @[@"batteryBar", @"memBar", @"dfBar", @"tempSpark",
+                            @"memSpark"]) {
+        NSView *v = labels[key];
+        [v.widthAnchor constraintEqualToAnchor:root.widthAnchor
+                                      constant:-36].active = YES;
+    }
+
+    self.infoWindow = w;
+    self.infoLabels = labels;
+    self.infoLive = live;
+    self.tempHistory = [NSMutableArray array];
+    self.memHistory = [NSMutableArray array];
+    self.batteryHistory = [NSMutableArray array];
+    [w layoutIfNeeded];
+    NSSize fit = root.fittingSize;
+    [w setContentSize:NSMakeSize(MAX(400, fit.width), fit.height)];
+    [w center];
+}
+
+- (void)setInfoText:(NSString *)text forKey:(NSString *)key {
+    NSTextField *l = self.infoLabels[key];
+    if ([l isKindOfClass:[NSTextField class]]) {
+        l.stringValue = text ?: @"—";
+    }
+}
+
+- (void)updateDeviceInfoUI:(NSDictionary *)i {
+    self.lastInfo = i;
+    NSDictionary *L = self.infoLabels;
+
+    if (i[@"level"]) {
+        int level = [i[@"level"] intValue];
+        [self setInfoText:[NSString stringWithFormat:@"%d %%", level]
+                   forKey:@"batteryBig"];
+        SCBarView *bar = L[@"batteryBar"];
+        bar.fraction = level / 100.0;
+        bar.color = level <= 15 ? NSColor.systemRedColor
+                  : level <= 30 ? NSColor.systemOrangeColor
+                                : NSColor.systemGreenColor;
+        [self setInfoText:[NSString stringWithFormat:@"%@%@ · %@", i[@"status"],
+                              [i[@"plugged"] length]
+                                  ? [NSString stringWithFormat:@" (%@)", i[@"plugged"]]
+                                  : @"", i[@"health"]]
+                   forKey:@"batteryLine"];
+        double temp = [i[@"batteryTemp"] doubleValue];
+        [self setInfoText:[NSString stringWithFormat:@"%.1f °C · %.2f V", temp,
+                              [i[@"voltage"] doubleValue]]
+                   forKey:@"batteryLine2"];
+        ((NSTextField *) L[@"batteryLine2"]).textColor = temperature_color(temp);
+        [self.tempHistory addObject:@(temp)];
+        SCSparkView *spark = L[@"tempSpark"];
+        spark.color = temperature_color(temp);
+        spark.values = [self.tempHistory copy];
+    }
+
+    if (i[@"MemTotal"]) {
+        double total = [i[@"MemTotal"] doubleValue];
+        double avail = [i[@"MemAvailable"] doubleValue];
+        [self setInfoText:[NSString stringWithFormat:@"%@ free of %@",
+                              format_bytes_kb(avail), format_bytes_kb(total)]
+                   forKey:@"memLine"];
+        SCBarView *bar = L[@"memBar"];
+        double used = total ? (total - avail) / total : 0;
+        bar.fraction = used;
+        bar.color = used >= 0.9 ? NSColor.systemRedColor
+                  : used >= 0.75 ? NSColor.systemOrangeColor
+                                 : NSColor.controlAccentColor;
+        double swap_total = [i[@"SwapTotal"] doubleValue];
+        [self setInfoText:swap_total
+            ? [NSString stringWithFormat:@"Swap: %@ used of %@",
+                  format_bytes_kb(swap_total - [i[@"SwapFree"] doubleValue]),
+                  format_bytes_kb(swap_total)]
+            : @"No swap" forKey:@"swapLine"];
+        [self.memHistory addObject:@(used * 100)];
+        SCSparkView *spark = L[@"memSpark"];
+        spark.color = bar.color;
+        spark.values = [self.memHistory copy];
+    }
+
+    if (i[@"dfTotal"]) {
+        double total = [i[@"dfTotal"] doubleValue];
+        double avail = [i[@"dfAvail"] doubleValue];
+        [self setInfoText:[NSString stringWithFormat:@"%@ free of %@",
+                              format_bytes_kb(avail), format_bytes_kb(total)]
+                   forKey:@"dfLine"];
+        SCBarView *bar = L[@"dfBar"];
+        double used = total ? 1 - avail / total : 0;
+        bar.fraction = used;
+        bar.color = used >= 0.9 ? NSColor.systemRedColor
+                  : used >= 0.75 ? NSColor.systemOrangeColor
+                                 : NSColor.controlAccentColor;
+    }
+
+    [self setInfoText:[NSString stringWithFormat:@"%@ · CPU %@ · SoC %@",
+        i[@"thermalStatus"],
+        i[@"cpuTemp"] ? [NSString stringWithFormat:@"%.0f °C", [i[@"cpuTemp"] doubleValue]] : @"—",
+        i[@"socTemp"] ? [NSString stringWithFormat:@"%.0f °C", [i[@"socTemp"] doubleValue]] : @"—"]
+               forKey:@"thermalLine"];
+    [self setInfoText:[NSString stringWithFormat:@"Display %@ · Skin %@",
+        i[@"dispTemp"] ? [NSString stringWithFormat:@"%.0f °C", [i[@"dispTemp"] doubleValue]] : @"—",
+        i[@"skinTemp"] ? [NSString stringWithFormat:@"%.0f °C", [i[@"skinTemp"] doubleValue]] : @"—"]
+               forKey:@"thermalLine2"];
+
+    if (i[@"ssid"]) {
+        [self setInfoText:[NSString stringWithFormat:@"%@ · %@ dBm (%@)", i[@"ssid"],
+                              i[@"rssi"], signal_quality([i[@"rssi"] intValue])]
+                   forKey:@"wifiLine"];
+        [self setInfoText:[NSString stringWithFormat:@"%@ Mbps · %@ · %@ MHz",
+                              i[@"linkSpeed"], i[@"wifiStandard"] ?: @"",
+                              i[@"frequency"] ?: @"?"]
+                   forKey:@"wifiLine2"];
+    } else {
+        [self setInfoText:@"Not connected to Wi-Fi" forKey:@"wifiLine"];
+        [self setInfoText:@"" forKey:@"wifiLine2"];
+    }
+
+    if (i[@"package"]) {
+        [self setInfoText:i[@"package"] forKey:@"focusLine"];
+        [self setInfoText:[NSString stringWithFormat:@"%@ · %@", i[@"activity"],
+                              i[@"awake"]]
+                   forKey:@"focusLine2"];
+    } else {
+        [self setInfoText:@"No app in the foreground" forKey:@"focusLine"];
+        [self setInfoText:i[@"awake"] forKey:@"focusLine2"];
+    }
+
+    [self setInfoText:[NSString stringWithFormat:@"Load average %@", i[@"load"] ?: @"—"]
+               forKey:@"loadLine"];
+    [self setInfoText:[NSString stringWithFormat:@"Up %@",
+                          i[@"uptime"] ? format_uptime([i[@"uptime"] doubleValue])
+                                       : @"—"]
+               forKey:@"uptimeLine"];
+    // Keep the history short
+    for (NSMutableArray *history in @[self.tempHistory, self.memHistory]) {
+        while (history.count > 60) {
+            [history removeObjectAtIndex:0];
+        }
+    }
+}
+
+- (void)refreshDeviceInfo {
+    if (self.infoBusy || !self.infoWindow) {
+        return;
+    }
+    self.infoBusy = YES;
+    [self runAdb:@[@"shell", kLiveInfoScript]
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        self.infoBusy = NO;
+        if (status != 0 || ![out containsString:@"@@end"]) {
+            return; // try again at the next tick
+        }
+        [self updateDeviceInfoUI:parse_live_info(out)];
+    }];
+}
+
+- (void)startInfoTimer {
+    [self.infoTimer invalidate];
+    __weak SCController *weak = self;
+    self.infoTimer = [NSTimer scheduledTimerWithTimeInterval:3
+                                                     repeats:YES
+                                                       block:^(NSTimer *timer) {
+        SCController *strong = weak;
+        // No work while the window can't be seen or the live mode is paused
+        if (!strong.infoWindow.visible
+                || !(strong.infoWindow.occlusionState
+                     & NSWindowOcclusionStateVisible)
+                || strong.infoLive.state != NSControlStateValueOn) {
+            return;
+        }
+        [strong refreshDeviceInfo];
+    }];
+}
+
+- (void)showDeviceInfo:(id)sender {
+    if (!self.infoWindow) {
+        [self buildDeviceInfoWindow];
+    }
+    [self updateToolPanelLevels];
+    [self.infoWindow makeKeyAndOrderFront:nil];
+    [self refreshDeviceInfo];
+    [self startInfoTimer];
+}
+
+- (void)infoLiveChanged:(id)sender {
+    if (self.infoLive.state == NSControlStateValueOn) {
+        [self refreshDeviceInfo];
+    }
+}
+
+- (void)copyDeviceInfoText:(id)sender {
+    if (!self.lastInfo) {
+        return;
+    }
+    [self copyToClipboard:live_info_text(self.lastInfo)];
+    [self flash:@"Device info copied"];
+}
+
+- (void)windowWillClose:(NSNotification *)notification {
+    if (notification.object == self.infoWindow) {
+        [self.infoTimer invalidate];
+        self.infoTimer = nil;
     }
 }
 
