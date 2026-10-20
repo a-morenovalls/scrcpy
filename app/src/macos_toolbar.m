@@ -2320,6 +2320,283 @@ static NSString *const kScreenOffOnStartKey = @"scrcpy.screenOffOnStart";
                    : @"Sessions will start with the device screen on"];
 }
 
+#pragma mark - Keyboard shortcuts
+
+// Shortcut of every option of the menus, by identifier. "c" is Command, "o"
+// Option, "s" Shift and "k" Control. They avoid the ones of macOS and SDL (Cmd+H
+// hide, Opt+Cmd+H hide others, Ctrl+Cmd+F full screen, Opt+Cmd+W close all,
+// Opt+Cmd+T toolbar) and keep the ones that scrcpy already has (Cmd+B back...).
+static NSDictionary<NSString *, NSString *> *
+shortcut_table(void) {
+    static NSDictionary *table;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        table = @{
+            // navigation
+            @"tag:BACK": @"c+b", @"tag:HOME": @"s+c+h",
+            @"tag:APP_SWITCH": @"c+s", @"tag:NOTIFICATIONS": @"c+n",
+            @"tag:SETTINGS": @"k+c+n",
+            // hardware
+            @"rot:0": @"c+r", @"rot:1": @"o+c+left", @"rot:2": @"o+c+right",
+            @"act:toggleAutoRotate:": @"o+c+r",
+            @"tag:VOLUME_UP": @"o+c+up", @"tag:VOLUME_DOWN": @"o+c+down",
+            @"tag:POWER": @"o+c+p",
+            @"tag:SCREENSHOT": @"o+c+s", @"tag:RECORD": @"s+c+r",
+            @"act:toggleKeepAwake:": @"o+c+a",
+            // stream
+            @"q:0": @"k+c+1", @"q:1": @"k+c+2", @"q:2": @"k+c+3",
+            @"q:3": @"k+c+4", @"q:4": @"k+c+5",
+            @"fps:0": @"k+o+c+1", @"fps:1": @"k+o+c+2", @"fps:2": @"k+o+c+3",
+            @"fps:3": @"k+o+c+4", @"fps:4": @"k+o+c+5", @"fps:5": @"k+o+c+6",
+            @"au:0": @"s+o+c+1", @"au:1": @"s+o+c+2", @"au:2": @"s+o+c+3",
+            // device screen
+            @"tag:SCREEN_OFF": @"o+c+o", @"tag:SCREEN_ON": @"s+o+c+o",
+            @"act:toggleScreenOffOnStart:": @"k+c+o",
+            // identifiers
+            @"info:hw_serial": @"k+c+i", @"info:adb_serial": @"k+s+c+i",
+            @"act:copyAllInfo:": @"k+o+c+i",
+            @"info:name": @"k+o+c+n",
+            @"info:model": @"k+o+c+m",
+            @"info:manufacturer": @"k+o+c+u",
+            @"info:brand": @"k+o+c+b",
+            @"info:codename": @"k+o+c+c",
+            @"info:android": @"k+o+c+v",
+            @"info:api": @"k+o+c+p",
+            @"info:patch": @"k+o+c+s",
+            @"info:build": @"k+o+c+d",
+            @"info:fingerprint": @"k+o+c+f",
+            @"info:kernel": @"k+o+c+k",
+            @"info:abi": @"k+o+c+a",
+            @"info:resolution": @"k+o+c+r",
+            @"info:density": @"k+o+c+e",
+            @"info:ram": @"k+o+c+y",
+            @"info:storage": @"k+o+c+t",
+            @"info:battery": @"k+o+c+l",
+            @"info:ip": @"k+o+c+w",
+            @"info:android_id": @"k+o+c+x",
+            @"info:locale": @"k+o+c+g",
+            @"info:timezone": @"k+o+c+z",
+            @"info:adb_cmd": @"k+o+c+j",
+            // connection
+            @"act:openAnotherDevice:": @"s+c+n",
+            @"act:connectWifi:": @"s+o+c+w", @"act:pairDevice:": @"s+o+c+p",
+            @"act:switchToWifi:": @"k+c+w", @"act:disconnectWifi:": @"k+s+c+w",
+            // developer
+            @"tag:DEV_MENU": @"o+c+m", @"tag:DEV_RELOAD": @"o+c+l",
+            @"tool:metro": @"k+c+m", @"tool:url": @"k+c+u",
+            @"tool:cache": @"k+c+k", @"tool:logcat": @"k+c+l",
+            @"tool:animations": @"k+c+a", @"tool:pointer": @"k+c+t",
+            @"tool:layout": @"k+c+b", @"tool:devsettings": @"k+c+s",
+            @"tool:activity": @"k+c+j", @"tool:dark": @"k+s+c+d",
+            @"tool:touches": @"k+s+c+t",
+            // clipboard, view, window
+            @"act:pasteToDevice:": @"o+c+v", @"act:copyFromDevice:": @"o+c+c",
+            @"act:typeClipboard:": @"s+o+c+v",
+            @"fr:0": @"k+s+c+0", @"fr:1": @"k+s+c+1", @"fr:2": @"k+s+c+2",
+            @"fr:3": @"k+s+c+3", @"fr:4": @"k+s+c+4", @"fr:5": @"k+s+c+5",
+            @"fr:6": @"k+s+c+6",
+            @"fr:7": @"k+s+c+-", @"fr:8": @"k+s+c+=", @"fr:9": @"k+s+c+[",
+            @"fr:10": @"k+s+c+]", @"fr:11": @"k+s+c+;", @"fr:12": @"k+s+c+'",
+            @"fr:13": @"k+s+c+,",
+            @"act:toggleKeepOnTop:": @"k+c+p",
+            @"act:showAppManager:": @"k+c+x",
+            @"act:showDeviceInfo:": @"k+c+g",
+            // files
+            @"act:installAPKItem:": @"s+c+i", @"act:sendFilesItem:": @"s+c+o",
+            @"act:toggleGrantPermissions:": @"k+s+c+g",
+            @"act:toggleOpenAfterSend:": @"k+s+c+o",
+            @"tf:0": @"k+s+o+c+1", @"tf:1": @"k+s+o+c+2", @"tf:2": @"k+s+o+c+3",
+            @"tf:3": @"k+s+o+c+4", @"tf:4": @"k+s+o+c+5", @"tf:5": @"k+s+o+c+6",
+        };
+    });
+    return table;
+}
+
+static NSString *
+tag_name(NSInteger tag) {
+    switch (tag) {
+        case SC_TOOLBAR_BUTTON_BACK: return @"BACK";
+        case SC_TOOLBAR_BUTTON_HOME: return @"HOME";
+        case SC_TOOLBAR_BUTTON_APP_SWITCH: return @"APP_SWITCH";
+        case SC_TOOLBAR_BUTTON_NOTIFICATIONS: return @"NOTIFICATIONS";
+        case SC_TOOLBAR_BUTTON_SETTINGS: return @"SETTINGS";
+        case SC_TOOLBAR_BUTTON_VOLUME_UP: return @"VOLUME_UP";
+        case SC_TOOLBAR_BUTTON_VOLUME_DOWN: return @"VOLUME_DOWN";
+        case SC_TOOLBAR_BUTTON_POWER: return @"POWER";
+        case SC_TOOLBAR_BUTTON_DEV_MENU: return @"DEV_MENU";
+        case SC_TOOLBAR_BUTTON_DEV_RELOAD: return @"DEV_RELOAD";
+        case SC_TOOLBAR_BUTTON_SCREEN_OFF: return @"SCREEN_OFF";
+        case SC_TOOLBAR_BUTTON_SCREEN_ON: return @"SCREEN_ON";
+        case SC_TAG_SCREENSHOT: return @"SCREENSHOT";
+        case SC_TAG_RECORD: return @"RECORD";
+    }
+    return [NSString stringWithFormat:@"%ld", (long) tag];
+}
+
+// Identifier of a menu item in the shortcut table, or nil
+- (NSString *)shortcutIdentifierForItem:(NSMenuItem *)item {
+    SEL action = item.action;
+    if (!action) {
+        return nil;
+    }
+    if (action == @selector(buttonClicked:)) {
+        return [@"tag:" stringByAppendingString:tag_name(item.tag)];
+    }
+    if (action == @selector(toolsMenuItem:)) {
+        return [@"tool:" stringByAppendingString:item.representedObject];
+    }
+    if (action == @selector(copyInfoItem:)) {
+        return [@"info:" stringByAppendingString:item.representedObject];
+    }
+    if (action == @selector(rotateItem:)) {
+        return [NSString stringWithFormat:@"rot:%ld", (long) item.tag];
+    }
+    if (action == @selector(selectQuality:)) {
+        return [NSString stringWithFormat:@"q:%ld", (long) item.tag];
+    }
+    if (action == @selector(selectFps:)) {
+        return [NSString stringWithFormat:@"fps:%ld", (long) item.tag];
+    }
+    if (action == @selector(selectAudio:)) {
+        return [NSString stringWithFormat:@"au:%ld", (long) item.tag];
+    }
+    if (action == @selector(selectFrame:)) {
+        return [NSString stringWithFormat:@"fr:%ld", (long) item.tag];
+    }
+    if (action == @selector(selectTransferFolder:)) {
+        return [NSString stringWithFormat:@"tf:%ld", (long) item.tag];
+    }
+    return [@"act:" stringByAppendingString:NSStringFromSelector(action)];
+}
+
+static void
+apply_shortcut(NSMenuItem *item, NSString *spec) {
+    NSArray<NSString *> *parts = [spec componentsSeparatedByString:@"+"];
+    NSEventModifierFlags mask = 0;
+    for (NSUInteger i = 0; i + 1 < parts.count; ++i) {
+        NSString *m = parts[i];
+        if ([m isEqualToString:@"c"]) {
+            mask |= NSEventModifierFlagCommand;
+        } else if ([m isEqualToString:@"o"]) {
+            mask |= NSEventModifierFlagOption;
+        } else if ([m isEqualToString:@"s"]) {
+            mask |= NSEventModifierFlagShift;
+        } else if ([m isEqualToString:@"k"]) {
+            mask |= NSEventModifierFlagControl;
+        }
+    }
+
+    NSString *key = parts.lastObject;
+    unichar arrow = 0;
+    if ([key isEqualToString:@"left"]) {
+        arrow = NSLeftArrowFunctionKey;
+    } else if ([key isEqualToString:@"right"]) {
+        arrow = NSRightArrowFunctionKey;
+    } else if ([key isEqualToString:@"up"]) {
+        arrow = NSUpArrowFunctionKey;
+    } else if ([key isEqualToString:@"down"]) {
+        arrow = NSDownArrowFunctionKey;
+    }
+    if (!arrow && key.length >= 2 && [key hasPrefix:@"f"]
+            && [key substringFromIndex:1].integerValue >= 1) {
+        // F1...F12
+        arrow = (unichar) (NSF1FunctionKey
+                           + [key substringFromIndex:1].integerValue - 1);
+    }
+    item.keyEquivalent = arrow ? [NSString stringWithCharacters:&arrow
+                                                         length:1] : key;
+    item.keyEquivalentModifierMask = mask;
+}
+
+// Give a shortcut to every option of the menu that has one. The info items
+// are only reachable through the submenu, except the identifiers.
+- (void)applyShortcutsToMenu:(NSMenu *)menu {
+    NSDictionary *table = shortcut_table();
+    for (NSMenuItem *item in menu.itemArray) {
+        if (item.submenu) {
+            [self applyShortcutsToMenu:item.submenu];
+        }
+        NSString *identifier = [self shortcutIdentifierForItem:item];
+        NSString *spec = identifier ? table[identifier] : nil;
+        if (!spec) {
+            continue;
+        }
+        // The identifiers have a quick item in the menu, and the same one in
+        // the info submenu: only the quick one gets the shortcut
+        if (([identifier isEqualToString:@"info:hw_serial"]
+                || [identifier isEqualToString:@"info:adb_serial"])
+                && [menu.title isEqualToString:@"Copy Device Info"]) {
+            continue;
+        }
+        apply_shortcut(item, spec);
+    }
+}
+
+// Text of the shortcut of a menu item, like "⌥⌘R"
+static NSString *
+shortcut_text(NSMenuItem *item) {
+    if (!item.keyEquivalent.length) {
+        return @"";
+    }
+    NSMutableString *text = [NSMutableString string];
+    NSEventModifierFlags m = item.keyEquivalentModifierMask;
+    if (m & NSEventModifierFlagControl) {
+        [text appendString:@"⌃"];
+    }
+    if (m & NSEventModifierFlagOption) {
+        [text appendString:@"⌥"];
+    }
+    if (m & NSEventModifierFlagShift) {
+        [text appendString:@"⇧"];
+    }
+    if (m & NSEventModifierFlagCommand) {
+        [text appendString:@"⌘"];
+    }
+    unichar c = [item.keyEquivalent characterAtIndex:0];
+    switch (c) {
+        case NSLeftArrowFunctionKey: [text appendString:@"←"]; break;
+        case NSRightArrowFunctionKey: [text appendString:@"→"]; break;
+        case NSUpArrowFunctionKey: [text appendString:@"↑"]; break;
+        case NSDownArrowFunctionKey: [text appendString:@"↓"]; break;
+        default:
+            if (c >= NSF1FunctionKey && c <= NSF12FunctionKey) {
+                [text appendFormat:@"F%d", c - NSF1FunctionKey + 1];
+            } else {
+                [text appendString:item.keyEquivalent.uppercaseString];
+            }
+    }
+    return text;
+}
+
+static void
+dump_menu(NSMenu *menu, NSMutableString *out, int depth) {
+    for (NSMenuItem *item in menu.itemArray) {
+        if (item.separatorItem) {
+            continue;
+        }
+        [out appendFormat:@"%*s%@\t%@\n", depth * 2, "", item.title,
+            shortcut_text(item)];
+        if (item.submenu) {
+            dump_menu(item.submenu, out, depth + 1);
+        }
+    }
+}
+
+// Debug: SCRCPY_DUMP_MENU=<file> writes the menus (titles and shortcuts)
+static void
+dump_menu_if_requested(void) {
+    const char *path = getenv("SCRCPY_DUMP_MENU");
+    if (!path) {
+        return;
+    }
+    NSMutableString *out = [NSMutableString string];
+    dump_menu(NSApp.mainMenu, out, 0);
+    [out writeToFile:@(path)
+          atomically:YES
+            encoding:NSUTF8StringEncoding
+               error:nil];
+}
+
 #pragma mark - Drag and drop (install APKs, send files)
 
 static NSString *const kTransferFolderKey = @"scrcpy.transferFolder";
