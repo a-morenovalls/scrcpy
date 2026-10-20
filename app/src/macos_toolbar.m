@@ -202,6 +202,684 @@ menu_image(NSString *symbol, NSString *description) {
     return nil;
 }
 
+#pragma mark - Device menu (adb over Wi-Fi)
+
+static NSString *const kLastWifiAddressKey = @"scrcpy.lastWifiAddress";
+static const uint16_t kDefaultTcpipPort = 5555;
+
+- (BOOL)isWifiSerial {
+    return [self.serial containsString:@":"]
+        || [self.serial containsString:@"_adb-tls-connect"];
+}
+
+static NSString *
+trimmed(NSString *s) {
+    return [s stringByTrimmingCharactersInSet:
+               NSCharacterSet.whitespaceAndNewlineCharacterSet];
+}
+
+// Add the default port if the user typed only an IP address
+static NSString *
+normalized_address(NSString *input) {
+    NSString *addr = trimmed(input);
+    if (!addr.length) {
+        return nil;
+    }
+    if (![addr containsString:@":"]) {
+        addr = [NSString stringWithFormat:@"%@:%u", addr, kDefaultTcpipPort];
+    }
+    return addr;
+}
+
+// Devices advertised on the network (mDNS). The connect list holds the devices
+// with Wireless debugging enabled; the pairing list those showing a pairing
+// code.
+- (void)discoverDevices:(void (^)(NSArray<NSString *> *connect,
+                                  NSArray<NSString *> *pairing))done {
+    [self runAdb:@[@"mdns", @"services"]
+        useSerial:NO
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        NSMutableArray *connect = [NSMutableArray array];
+        NSMutableArray *pairing = [NSMutableArray array];
+        for (NSString *line in [out componentsSeparatedByCharactersInSet:
+                                    NSCharacterSet.newlineCharacterSet]) {
+            // "<name> <type> <ip:port>", separated by tabs or spaces
+            NSArray *f = [trimmed(line) componentsSeparatedByCharactersInSet:
+                             NSCharacterSet.whitespaceCharacterSet];
+            f = [f filteredArrayUsingPredicate:
+                    [NSPredicate predicateWithFormat:@"length > 0"]];
+            if (f.count < 3) {
+                continue;
+            }
+            NSString *type = f[f.count - 2];
+            NSString *address = f.lastObject;
+            if ([type containsString:@"_adb-tls-connect"]) {
+                [connect addObject:address];
+            } else if ([type containsString:@"_adb-tls-pairing"]) {
+                [pairing addObject:address];
+            }
+        }
+        done(connect, pairing);
+    }];
+}
+
+// In the app bundle, new sessions go through the launcher script, which applies
+// the stream quality for the device (Wi-Fi or USB). Otherwise, the binary.
+- (NSString *)launcherPath {
+    NSString *launcher = [NSBundle.mainBundle.bundlePath
+        stringByAppendingPathComponent:@"Contents/MacOS/scrcpy"];
+    if ([[NSFileManager defaultManager] isExecutableFileAtPath:launcher]) {
+        return launcher;
+    }
+    return NSBundle.mainBundle.executablePath;
+}
+
+// Start another scrcpy session for the given device
+- (void)launchSessionFor:(NSString *)serial {
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:[self launcherPath]];
+    task.arguments = @[@"-s", serial];
+    task.standardOutput = NSFileHandle.fileHandleWithNullDevice;
+    task.standardError = NSFileHandle.fileHandleWithNullDevice;
+    NSError *error = nil;
+    if (![task launchAndReturnError:&error]) {
+        [self flash:[NSString stringWithFormat:@"Could not open a session: %@",
+                        error.localizedDescription]];
+    }
+}
+
+- (void)quitCurrentSession {
+    SDL_Event event;
+    SDL_zero(event);
+    event.type = SDL_EVENT_QUIT;
+    SDL_PushEvent(&event);
+}
+
+// adb connect, then open a session for the device on success
+- (void)connectToAddress:(NSString *)input
+              completion:(void (^)(BOOL ok))completion {
+    NSString *addr = normalized_address(input);
+    if (!addr) {
+        return;
+    }
+    [self flash:[NSString stringWithFormat:@"Connecting to %@…", addr]];
+    [self runAdb:@[@"connect", addr]
+        useSerial:NO
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        // adb connect exits with 0 even when the connection fails
+        BOOL ok = [out containsString:@"connected to"];
+        if (ok) {
+            [[NSUserDefaults standardUserDefaults]
+                setObject:addr forKey:kLastWifiAddressKey];
+            [self flash:[NSString stringWithFormat:@"Connected to %@", addr]];
+            if ([addr isEqualToString:self.serial]) {
+                // Already mirroring this device
+            } else {
+                [self launchSessionFor:addr];
+            }
+        } else {
+            NSString *reason = trimmed(out.length ? out : err);
+            [self flash:[NSString stringWithFormat:@"Could not connect: %@",
+                            reason]];
+        }
+        if (completion) {
+            completion(ok);
+        }
+    }];
+}
+
+- (NSTextField *)labelWithText:(NSString *)text frame:(NSRect)frame {
+    NSTextField *label = [NSTextField labelWithString:text];
+    label.frame = frame;
+    return label;
+}
+
+// Sheet with a checkbox per device and a field for another address. The
+// handler receives the checked rows and the typed address (may be empty).
+- (void)showDevicePickerWithTitle:(NSString *)title
+                          message:(NSString *)message
+                             rows:(NSArray<NSDictionary *> *)rows
+                       confirmTitle:(NSString *)confirmTitle
+                          handler:(void (^)(NSArray<NSDictionary *> *selected,
+                                            NSString *manual))handler {
+    const CGFloat width = 380;
+    const CGFloat row_height = 24;
+    CGFloat list_height = rows.count * row_height;
+    CGFloat total = list_height + (rows.count ? 14 : 0) + 50;
+
+    NSView *accessory =
+        [[NSView alloc] initWithFrame:NSMakeRect(0, 0, width, total)];
+    NSMutableArray<NSButton *> *boxes = [NSMutableArray array];
+    for (NSUInteger i = 0; i < rows.count; ++i) {
+        NSButton *box = [NSButton checkboxWithTitle:rows[i][@"title"]
+                                             target:nil
+                                             action:nil];
+        box.frame = NSMakeRect(0, total - (i + 1) * row_height,
+                               width, row_height);
+        // Devices ready to open are checked by default
+        box.state = rows[i][@"checked"] ? NSControlStateValueOn
+                                        : NSControlStateValueOff;
+        [accessory addSubview:box];
+        [boxes addObject:box];
+    }
+
+    NSTextField *manual =
+        [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, width, 24)];
+    manual.placeholderString = @"192.168.1.20 or 192.168.1.20:5555";
+    [accessory addSubview:manual];
+    [accessory addSubview:[self labelWithText:@"Other device (IP address):"
+                                        frame:NSMakeRect(0, 28, width, 18)]];
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = title;
+    alert.informativeText = message;
+    alert.accessoryView = accessory;
+    [alert addButtonWithTitle:confirmTitle];
+    [alert addButtonWithTitle:@"Cancel"];
+    [alert beginSheetModalForWindow:self.window
+                  completionHandler:^(NSModalResponse response) {
+        if (response != NSAlertFirstButtonReturn) {
+            return;
+        }
+        NSMutableArray *selected = [NSMutableArray array];
+        for (NSUInteger i = 0; i < boxes.count; ++i) {
+            if (boxes[i].state == NSControlStateValueOn) {
+                [selected addObject:rows[i]];
+            }
+        }
+        handler(selected, trimmed(manual.stringValue));
+    }];
+}
+
+// Serials of the sessions already open (the other processes are found by the
+// "-s <serial>" argument that the launcher always passes)
+- (NSSet<NSString *> *)openSerials {
+    NSMutableSet *serials = [NSMutableSet set];
+    if (self.serial) {
+        [serials addObject:self.serial];
+    }
+
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:@"/bin/ps"];
+    task.arguments = @[@"-axww", @"-o", @"args="];
+    NSPipe *pipe = [NSPipe pipe];
+    task.standardOutput = pipe;
+    task.standardError = NSFileHandle.fileHandleWithNullDevice;
+    if (![task launchAndReturnError:nil]) {
+        return serials;
+    }
+    NSData *data = [pipe.fileHandleForReading readDataToEndOfFile];
+    [task waitUntilExit];
+    NSString *out = [[NSString alloc] initWithData:data
+                                          encoding:NSUTF8StringEncoding];
+    NSRegularExpression *re = [NSRegularExpression
+        regularExpressionWithPattern:@"(?:\\s-s\\s+|--serial=)(\\S+)"
+                             options:0
+                               error:nil];
+    for (NSString *line in [out componentsSeparatedByString:@"\n"]) {
+        if (![line containsString:@"/scrcpy-bin"]) {
+            continue;
+        }
+        NSTextCheckingResult *m =
+            [re firstMatchInString:line
+                           options:0
+                             range:NSMakeRange(0, line.length)];
+        if (m) {
+            [serials addObject:[line substringWithRange:[m rangeAtIndex:1]]];
+        }
+    }
+    return serials;
+}
+
+// Devices known by adb (USB and Wi-Fi), as {serial, model}
+- (void)listConnectedDevices:(void (^)(NSArray<NSDictionary *> *))done {
+    [self runAdb:@[@"devices", @"-l"]
+        useSerial:NO
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        NSMutableArray *devices = [NSMutableArray array];
+        for (NSString *line in [out componentsSeparatedByCharactersInSet:
+                                    NSCharacterSet.newlineCharacterSet]) {
+            NSArray *f = [trimmed(line) componentsSeparatedByCharactersInSet:
+                             NSCharacterSet.whitespaceCharacterSet];
+            f = [f filteredArrayUsingPredicate:
+                    [NSPredicate predicateWithFormat:@"length > 0"]];
+            if (f.count < 2 || ![f[1] isEqualToString:@"device"]) {
+                continue;
+            }
+            NSString *model = @"";
+            for (NSString *token in f) {
+                if ([token hasPrefix:@"model:"]) {
+                    model = [[token substringFromIndex:6]
+                        stringByReplacingOccurrencesOfString:@"_"
+                                                  withString:@" "];
+                }
+            }
+            [devices addObject:@{@"serial": f[0], @"model": model}];
+        }
+        done(devices);
+    }];
+}
+
+// Open the selected rows: connected devices get a window, devices only seen
+// on the network are connected first
+- (void)openRows:(NSArray<NSDictionary *> *)rows manual:(NSString *)manual {
+    for (NSDictionary *row in rows) {
+        if (row[@"serial"]) {
+            [self launchSessionFor:row[@"serial"]];
+        } else if (row[@"address"]) {
+            [self connectToAddress:row[@"address"] completion:nil];
+        }
+    }
+    if (manual.length) {
+        [self connectToAddress:manual completion:nil];
+    }
+}
+
+- (void)openAnotherDevice:(id)sender {
+    [self flash:@"Looking for devices…"];
+    [self listConnectedDevices:^(NSArray<NSDictionary *> *devices) {
+        [self discoverDevices:^(NSArray *connect, NSArray *pairing) {
+            NSSet *open = [self openSerials];
+            NSMutableArray *rows = [NSMutableArray array];
+            NSMutableString *known = [NSMutableString string];
+            for (NSDictionary *d in devices) {
+                NSString *serial = d[@"serial"];
+                [known appendString:serial];
+                if ([open containsObject:serial]) {
+                    continue;
+                }
+                BOOL wifi = [serial containsString:@":"]
+                         || [serial containsString:@"_adb-tls"];
+                NSString *name = [d[@"model"] length] ? d[@"model"]
+                                                       : @"Android device";
+                [rows addObject:@{
+                    @"title": [NSString stringWithFormat:@"%@ — %@ (%@)", name,
+                                  serial, wifi ? @"Wi-Fi" : @"USB"],
+                    @"serial": serial,
+                    @"checked": @YES,
+                }];
+            }
+            for (NSString *address in connect) {
+                if ([known containsString:address]) {
+                    continue;
+                }
+                [rows addObject:@{
+                    @"title": [NSString stringWithFormat:
+                                  @"%@ (found on the network)", address],
+                    @"address": address,
+                }];
+            }
+            [self showDevicePickerWithTitle:@"Open Another Device"
+                                    message:rows.count
+                ? @"Pick the devices to open, each one in its own window."
+                : @"Every connected device is already open. Type an IP "
+                  @"address to connect another one."
+                                       rows:rows
+                               confirmTitle:@"Open"
+                                    handler:^(NSArray *selected,
+                                              NSString *manual) {
+                [self openRows:selected manual:manual];
+            }];
+        }];
+    }];
+}
+
+- (void)connectWifi:(id)sender {
+    [self flash:@"Looking for devices on the network…"];
+    [self discoverDevices:^(NSArray *connect, NSArray *pairing) {
+        NSMutableArray *rows = [NSMutableArray array];
+        for (NSString *address in connect) {
+            [rows addObject:@{
+                @"title": address,
+                @"address": address,
+                @"checked": @YES,
+            }];
+        }
+        [self showDevicePickerWithTitle:@"Connect via Wi-Fi"
+                                message:rows.count
+            ? @"Devices found on the network. Check the ones to connect."
+            : @"No device found automatically. Type its IP address (Settings "
+              @"→ Developer options → Wireless debugging). If it was never "
+              @"paired, use Device → Pair Device…."
+                                   rows:rows
+                           confirmTitle:@"Connect"
+                                handler:^(NSArray *selected, NSString *manual) {
+            [self openRows:selected manual:manual];
+        }];
+    }];
+}
+
+- (void)pairDevice:(id)sender {
+    [self discoverDevices:^(NSArray *connect, NSArray *pairing) {
+        NSComboBox *address = [[NSComboBox alloc]
+            initWithFrame:NSMakeRect(0, 52, 340, 26)];
+        [address addItemsWithObjectValues:pairing];
+        address.stringValue = pairing.firstObject ?: @"";
+        address.placeholderString = @"192.168.1.20:37215";
+        NSTextField *code =
+            [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 340, 24)];
+        code.placeholderString = @"123456";
+
+        NSView *accessory =
+            [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 340, 100)];
+        [accessory addSubview:address];
+        [accessory addSubview:[self labelWithText:@"Pairing address:"
+                                            frame:NSMakeRect(0, 80, 340, 18)]];
+        [accessory addSubview:code];
+        [accessory addSubview:[self labelWithText:@"Pairing code:"
+                                            frame:NSMakeRect(0, 26, 340, 18)]];
+
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"Pair Device";
+        alert.informativeText =
+            @"On the device: Developer options → Wireless debugging → Pair "
+            @"device with pairing code. Enter the address and code shown.";
+        alert.accessoryView = accessory;
+        [alert addButtonWithTitle:@"Pair"];
+        [alert addButtonWithTitle:@"Cancel"];
+        [alert beginSheetModalForWindow:self.window
+                      completionHandler:^(NSModalResponse response) {
+            if (response != NSAlertFirstButtonReturn) {
+                return;
+            }
+            NSString *addr = trimmed(address.stringValue);
+            NSString *pin = trimmed(code.stringValue);
+            if (!addr.length || !pin.length) {
+                return;
+            }
+            [self runAdb:@[@"pair", addr, pin]
+                useSerial:NO
+                stdoutFile:nil
+                      done:^(int status, NSString *out, NSString *err) {
+                if ([out containsString:@"Successfully paired"]) {
+                    [self flash:@"Paired. Now connect to the device."];
+                    [self connectWifi:nil];
+                } else {
+                    [self flash:[NSString stringWithFormat:@"Pairing failed: %@",
+                                    trimmed(out.length ? out : err)]];
+                }
+            }];
+        }];
+    }];
+}
+
+// Move the current (USB) device to Wi-Fi so that the cable can be unplugged
+- (void)switchToWifi:(id)sender {
+    if ([self isWifiSerial]) {
+        [self flash:@"Already connected over Wi-Fi"];
+        return;
+    }
+
+    [self flash:@"Switching to Wi-Fi…"];
+    [self runAdb:@[@"shell", @"ip -f inet addr show wlan0"]
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        NSRegularExpression *re = [NSRegularExpression
+            regularExpressionWithPattern:@"inet (\\d+\\.\\d+\\.\\d+\\.\\d+)/"
+                                 options:0
+                                   error:nil];
+        NSTextCheckingResult *m =
+            [re firstMatchInString:out
+                           options:0
+                             range:NSMakeRange(0, out.length)];
+        if (status != 0 || !m) {
+            [self flash:@"The device is not connected to a Wi-Fi network"];
+            return;
+        }
+        NSString *address = [NSString stringWithFormat:@"%@:%u",
+            [out substringWithRange:[m rangeAtIndex:1]], kDefaultTcpipPort];
+
+        // Restarting adbd in TCP mode drops the USB connection, which ends
+        // this session (and this process). The rest of the switch is thus
+        // done by a detached helper that outlives it.
+        static NSString *const script =
+            @"adb=\"$1\"; serial=\"$2\"; addr=\"$3\"; exe=\"$4\"; port=\"$5\"\n"
+            @"if [ -n \"$serial\" ]; then\n"
+            @"    \"$adb\" -s \"$serial\" tcpip \"$port\" >/dev/null 2>&1\n"
+            @"else\n"
+            @"    \"$adb\" tcpip \"$port\" >/dev/null 2>&1\n"
+            @"fi\n"
+            @"for i in 1 2 3 4 5 6 7 8 9 10 11 12; do\n"
+            @"    sleep 1\n"
+            @"    out=$(\"$adb\" connect \"$addr\" 2>&1)\n"
+            @"    case \"$out\" in\n"
+            @"        *\"connected to\"*)\n"
+            @"            exec \"$exe\" -s \"$addr\" >/dev/null 2>&1 ;;\n"
+            @"    esac\n"
+            @"done\n"
+            @"osascript -e 'display dialog \"Could not connect to '\"$addr\"'"
+            @" over Wi-Fi. The device and this Mac must be on the same network.\""
+            @" buttons {\"OK\"} default button \"OK\" with icon caution"
+            @" with title \"scrcpy\"' >/dev/null 2>&1\n";
+
+        NSTask *helper = [[NSTask alloc] init];
+        helper.executableURL = [NSURL fileURLWithPath:@"/bin/sh"];
+        helper.arguments = @[@"-c", script, @"sh", self.adb, self.serial ?: @"",
+                             address, [self launcherPath],
+                             [NSString stringWithFormat:@"%u",
+                                 kDefaultTcpipPort]];
+        helper.standardOutput = NSFileHandle.fileHandleWithNullDevice;
+        helper.standardError = NSFileHandle.fileHandleWithNullDevice;
+        NSError *error = nil;
+        if (![helper launchAndReturnError:&error]) {
+            [self flash:[NSString stringWithFormat:@"Could not switch: %@",
+                            error.localizedDescription]];
+            return;
+        }
+
+        [[NSUserDefaults standardUserDefaults]
+            setObject:address forKey:kLastWifiAddressKey];
+        [self flash:@"Switching to Wi-Fi… a new window will open"];
+    }];
+}
+
+- (void)disconnectWifi:(id)sender {
+    if (![self isWifiSerial]) {
+        return;
+    }
+    [self runAdb:@[@"disconnect", self.serial]
+        useSerial:NO
+        stdoutFile:nil
+              done:nil];
+}
+
+- (void)insertTopMenu:(NSMenu *)menu title:(NSString *)title {
+    NSMenu *main = NSApp.mainMenu;
+    if (!main) {
+        return;
+    }
+    NSMenuItem *top = [[NSMenuItem alloc] initWithTitle:title
+                                                 action:nil
+                                          keyEquivalent:@""];
+    top.submenu = menu;
+
+    // Before the Window menu
+    NSInteger index = main.numberOfItems;
+    NSInteger window_index = [main indexOfItemWithSubmenu:NSApp.windowsMenu];
+    if (window_index >= 0) {
+        index = window_index;
+    }
+    [main insertItem:top atIndex:index];
+}
+
+- (NSMenuItem *)wifiItemWithTitle:(NSString *)title
+                           symbol:(NSString *)symbol
+                           action:(SEL)action
+                              key:(NSString *)key {
+    NSMenuItem *item = [self itemWithTitle:title
+                                    symbol:symbol
+                                    action:action
+                                       tag:0];
+    if (key.length) {
+        item.keyEquivalent = key;
+        item.keyEquivalentModifierMask =
+            NSEventModifierFlagCommand | NSEventModifierFlagOption;
+    }
+    return item;
+}
+
+// Wi-Fi connection items, shared by the menu bar and the window controls
+- (void)addWifiItemsTo:(NSMenu *)menu {
+    [menu addItem:[self wifiItemWithTitle:@"Open Another Device…"
+                                   symbol:@"iphone.gen3.badge.plus"
+                                   action:@selector(openAnotherDevice:)
+                                      key:@"n"]];
+    [menu addItem:[self wifiItemWithTitle:@"Connect via Wi-Fi…"
+                                   symbol:@"wifi"
+                                   action:@selector(connectWifi:)
+                                      key:@"w"]];
+    [menu addItem:[self wifiItemWithTitle:@"Pair Device…"
+                                   symbol:@"link"
+                                   action:@selector(pairDevice:)
+                                      key:@""]];
+    [menu addItem:[self wifiItemWithTitle:@"Switch This Device to Wi-Fi"
+                                   symbol:@"cable.connector.slash"
+                                   action:@selector(switchToWifi:)
+                                      key:@""]];
+    [menu addItem:[self wifiItemWithTitle:@"Disconnect Wi-Fi Device"
+                                   symbol:@"wifi.slash"
+                                   action:@selector(disconnectWifi:)
+                                      key:@""]];
+}
+
+// "Device" menu of the menu bar: everything the window controls do
+- (void)installDeviceMenu {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Device"];
+
+    struct {
+        __unsafe_unretained NSString *title;
+        __unsafe_unretained NSString *symbol;
+        NSInteger tag;
+    } nav[] = {
+        {@"Back", @"arrowtriangle.backward", SC_TOOLBAR_BUTTON_BACK},
+        {@"Home", @"circle", SC_TOOLBAR_BUTTON_HOME},
+        {@"Recents", @"square", SC_TOOLBAR_BUTTON_APP_SWITCH},
+        {@"Notifications", @"bell", SC_TOOLBAR_BUTTON_NOTIFICATIONS},
+        {@"Settings Panel", @"gearshape", SC_TOOLBAR_BUTTON_SETTINGS},
+    };
+    for (size_t i = 0; i < sizeof(nav) / sizeof(nav[0]); ++i) {
+        [menu addItem:[self itemWithTitle:nav[i].title
+                                   symbol:nav[i].symbol
+                                   action:@selector(buttonClicked:)
+                                      tag:nav[i].tag]];
+    }
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    [menu addItem:[self itemWithTitle:@"Rotate Device"
+                               symbol:@"rotate.right"
+                               action:@selector(rotateItem:)
+                                  tag:SC_ROTATE_TOGGLE]];
+    [menu addItem:[self itemWithTitle:@"Rotate Device Left"
+                               symbol:@"rotate.left"
+                               action:@selector(rotateItem:)
+                                  tag:SC_ROTATE_LEFT]];
+    [menu addItem:[self itemWithTitle:@"Rotate Device Right"
+                               symbol:@"rotate.right"
+                               action:@selector(rotateItem:)
+                                  tag:SC_ROTATE_RIGHT]];
+    [menu addItem:[self itemWithTitle:@"Toggle Auto-Rotate"
+                               symbol:@"lock.rotation"
+                               action:@selector(toggleAutoRotate:)
+                                  tag:0]];
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    [menu addItem:[self itemWithTitle:@"Volume Up"
+                               symbol:@"speaker.plus"
+                               action:@selector(buttonClicked:)
+                                  tag:SC_TOOLBAR_BUTTON_VOLUME_UP]];
+    [menu addItem:[self itemWithTitle:@"Volume Down"
+                               symbol:@"speaker.minus"
+                               action:@selector(buttonClicked:)
+                                  tag:SC_TOOLBAR_BUTTON_VOLUME_DOWN]];
+    [menu addItem:[self itemWithTitle:@"Power"
+                               symbol:@"power"
+                               action:@selector(buttonClicked:)
+                                  tag:SC_TOOLBAR_BUTTON_POWER]];
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    [menu addItem:[self itemWithTitle:@"Screenshot"
+                               symbol:@"camera"
+                               action:@selector(buttonClicked:)
+                                  tag:SC_TAG_SCREENSHOT]];
+    [menu addItem:[self itemWithTitle:@"Start Recording"
+                               symbol:@"record.circle"
+                               action:@selector(buttonClicked:)
+                                  tag:SC_TAG_RECORD]];
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem *awake = [self itemWithTitle:@"Keep Device Awake"
+                                     symbol:@"sun.max"
+                                     action:@selector(toggleKeepAwake:)
+                                        tag:0];
+    awake.keyEquivalent = @"a";
+    awake.keyEquivalentModifierMask =
+        NSEventModifierFlagCommand | NSEventModifierFlagOption;
+    [menu addItem:awake];
+    [menu addItem:[self qualityMenuItem]];
+    [menu addItem:[self frameRateMenuItem]];
+    [menu addItem:[self audioMenuItem]];
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    [menu addItem:[self itemWithTitle:@"Turn Device Screen Off"
+                               symbol:@"moon.fill"
+                               action:@selector(buttonClicked:)
+                                  tag:SC_TOOLBAR_BUTTON_SCREEN_OFF]];
+    [menu addItem:[self itemWithTitle:@"Turn Device Screen On"
+                               symbol:@"sun.max"
+                               action:@selector(buttonClicked:)
+                                  tag:SC_TOOLBAR_BUTTON_SCREEN_ON]];
+    [menu addItem:[self itemWithTitle:@"Start With Device Screen Off"
+                               symbol:@"moon.zzz"
+                               action:@selector(toggleScreenOffOnStart:)
+                                  tag:0]];
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    [self addCopyIdItemsTo:menu];
+    [menu addItem:[self deviceInfoMenuItem]];
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    [self addFileItemsTo:menu];
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    [self addWifiItemsTo:menu];
+    [self insertTopMenu:menu title:@"Device"];
+}
+
+// "Developer" menu of the menu bar
+- (void)installDeveloperMenu {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Developer"];
+    [menu addItem:[self itemWithTitle:@"App Manager…"
+                               symbol:@"square.grid.2x2"
+                               action:@selector(showAppManager:)
+                                  tag:0]];
+    [menu addItem:[self itemWithTitle:@"Device Info…"
+                               symbol:@"gauge"
+                               action:@selector(showDeviceInfo:)
+                                  tag:0]];
+    [menu addItem:[NSMenuItem separatorItem]];
+    [menu addItem:[self itemWithTitle:@"React Native Developer Menu"
+                               symbol:@"ladybug"
+                               action:@selector(buttonClicked:)
+                                  tag:SC_TOOLBAR_BUTTON_DEV_MENU]];
+    [menu addItem:[self itemWithTitle:@"Reload React Native"
+                               symbol:@"arrow.clockwise"
+                               action:@selector(buttonClicked:)
+                                  tag:SC_TOOLBAR_BUTTON_DEV_RELOAD]];
+    [menu addItem:[NSMenuItem separatorItem]];
+    NSMenu *tools = [self buildToolsMenu];
+    NSArray *items = tools.itemArray;
+    [tools removeAllItems];
+    for (NSMenuItem *item in items) {
+        [menu addItem:item];
+    }
+    [menu addItem:[NSMenuItem separatorItem]];
+    [self addSimulationItemsTo:menu];
+    [self insertTopMenu:menu title:@"Developer"];
+}
+
 #pragma mark - Window menu
 
 - (void)toggleKeepOnTop:(NSMenuItem *)item {
