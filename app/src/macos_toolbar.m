@@ -2595,6 +2595,482 @@ install_failure_reason(NSString *out, NSString *err) {
     }];
 }
 
+#pragma mark - More developer tools
+
+- (void)openURLOnDevice {
+    NSTextField *field =
+        [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 380, 24)];
+    field.placeholderString = @"https://example.com or myapp://screen/42";
+    // Prefill with the Mac clipboard if it holds a link, else the last URL
+    NSString *clip = trimmed([[NSPasteboard generalPasteboard]
+                                 stringForType:NSPasteboardTypeString] ?: @"");
+    NSRegularExpression *scheme = [NSRegularExpression
+        regularExpressionWithPattern:@"^[A-Za-z][A-Za-z0-9+.-]*://\\S+$"
+                             options:0
+                               error:nil];
+    BOOL clip_is_url = clip.length
+        && [scheme firstMatchInString:clip
+                              options:0
+                                range:NSMakeRange(0, clip.length)];
+    field.stringValue = clip_is_url ? clip
+        : ([[NSUserDefaults standardUserDefaults]
+               stringForKey:@"scrcpy.lastURL"] ?: @"");
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"Open URL on device";
+    alert.informativeText =
+        @"Opens a web link or a deep link in the matching app.";
+    alert.accessoryView = field;
+    [alert addButtonWithTitle:@"Open"];
+    [alert addButtonWithTitle:@"Cancel"];
+    alert.window.initialFirstResponder = field;
+    [alert beginSheetModalForWindow:self.window
+                  completionHandler:^(NSModalResponse response) {
+        NSString *url = trimmed(field.stringValue);
+        if (response != NSAlertFirstButtonReturn || !url.length) {
+            return;
+        }
+        [[NSUserDefaults standardUserDefaults] setObject:url
+                                                  forKey:@"scrcpy.lastURL"];
+        // Single-quote the URL for the device shell
+        NSString *quoted = [url stringByReplacingOccurrencesOfString:@"'"
+                                                          withString:@"'\\''"];
+        [self runShell:[NSString stringWithFormat:
+                @"am start -a android.intent.action.VIEW -d '%@'", quoted]
+               success:@"URL opened on the device"
+            completion:nil];
+    }];
+}
+
+// Logcat in a Terminal window (a .command file is opened by Terminal)
+- (void)openLogcat {
+    NSString *path = [NSTemporaryDirectory()
+        stringByAppendingPathComponent:@"scrcpy-logcat.command"];
+    NSString *serial_arg = self.serial
+        ? [NSString stringWithFormat:@"-s '%@' ", self.serial] : @"";
+    NSString *content = [NSString stringWithFormat:
+        @"#!/bin/bash\nclear\nexec '%@' %@logcat -v color\n", self.adb,
+        serial_arg];
+    NSError *error = nil;
+    if (![content writeToFile:path
+                   atomically:YES
+                     encoding:NSUTF8StringEncoding
+                        error:&error]) {
+        [self flash:@"Could not create the logcat script"];
+        return;
+    }
+    [[NSFileManager defaultManager]
+        setAttributes:@{NSFilePosixPermissions: @0755}
+         ofItemAtPath:path
+                error:nil];
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:path]];
+}
+
+#pragma mark - Clear app cache
+
+// Ask which app to clear (the foreground one is preselected), then clear its
+// cache. Clearing the data too is opt-in because it is destructive.
+- (void)clearAppCache {
+    NSString *cmd = @"pm list packages -3; echo ---;"
+                    @" dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'";
+    [self runAdb:@[@"shell", cmd]
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        if (status != 0) {
+            [self flash:@"Could not list the installed apps"];
+            return;
+        }
+
+        NSArray<NSString *> *parts = [out componentsSeparatedByString:@"---"];
+        NSMutableArray<NSString *> *packages = [NSMutableArray array];
+        for (NSString *line in [parts[0] componentsSeparatedByCharactersInSet:
+                                    NSCharacterSet.newlineCharacterSet]) {
+            NSString *l = [line stringByTrimmingCharactersInSet:
+                              NSCharacterSet.whitespaceCharacterSet];
+            if ([l hasPrefix:@"package:"]) {
+                [packages addObject:[l substringFromIndex:8]];
+            }
+        }
+        [packages sortUsingSelector:@selector(caseInsensitiveCompare:)];
+        if (!packages.count) {
+            [self flash:@"No third-party apps found"];
+            return;
+        }
+
+        NSString *foreground = nil;
+        if (parts.count > 1) {
+            NSRegularExpression *re = [NSRegularExpression
+                regularExpressionWithPattern:@"([A-Za-z0-9_.]+)/"
+                                     options:0
+                                       error:nil];
+            NSTextCheckingResult *m =
+                [re firstMatchInString:parts[1]
+                               options:0
+                                 range:NSMakeRange(0, [parts[1] length])];
+            if (m) {
+                foreground = [parts[1] substringWithRange:
+                                  [m rangeAtIndex:1]];
+            }
+        }
+
+        NSPopUpButton *popup = [[NSPopUpButton alloc]
+            initWithFrame:NSMakeRect(0, 28, 360, 26) pullsDown:NO];
+        [popup addItemsWithTitles:packages];
+        if (foreground && [packages containsObject:foreground]) {
+            [popup selectItemWithTitle:foreground];
+        }
+        NSButton *data = [NSButton checkboxWithTitle:
+            @"Also clear app data (signs out and resets the app)"
+                                              target:nil
+                                              action:nil];
+        data.frame = NSMakeRect(0, 0, 360, 22);
+        NSView *accessory =
+            [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 360, 56)];
+        [accessory addSubview:popup];
+        [accessory addSubview:data];
+
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"Clear app cache";
+        alert.informativeText = @"Choose the app on the device.";
+        alert.accessoryView = accessory;
+        [alert addButtonWithTitle:@"Clear"];
+        [alert addButtonWithTitle:@"Cancel"];
+        [alert beginSheetModalForWindow:self.window
+                      completionHandler:^(NSModalResponse response) {
+            if (response != NSAlertFirstButtonReturn) {
+                return;
+            }
+            NSString *package = popup.selectedItem.title;
+            BOOL clearData = data.state == NSControlStateValueOn;
+            if (!clearData) {
+                [self clearCacheOfPackage:package];
+                return;
+            }
+            NSString *shell = [NSString stringWithFormat:
+                @"pm clear '%@'", package];
+            [self runShell:shell
+                   success:[NSString stringWithFormat:@"%@ of %@ cleared",
+                               clearData ? @"Data and cache" : @"Cache",
+                               package]
+                completion:nil];
+        }];
+    }];
+}
+
+- (void)setRecording:(BOOL)recording {
+    NSToolbarItem *item = self.recordItem;
+    NSString *symbol = recording ? @"stop.circle.fill" : @"record.circle";
+    NSImage *image = [NSImage imageWithSystemSymbolName:symbol
+                               accessibilityDescription:@"Record"];
+    if (image && recording) {
+        // Red while recording
+        if (@available(macOS 12.0, *)) {
+            image = [image imageWithSymbolConfiguration:
+                [NSImageSymbolConfiguration configurationWithPaletteColors:
+                    @[NSColor.systemRedColor]]];
+        }
+    }
+    if (image) {
+        item.image = image;
+    }
+    item.toolTip = recording ? @"Stop recording" : @"Record screen";
+    item.label = recording ? @"Stop" : @"Record";
+    if (@available(macOS 11.0, *)) {
+        self.window.subtitle = recording
+                             ? @"● Recording… (click record to stop)" : @"";
+    }
+}
+
+- (void)toggleRecording {
+    if (self.recordTask) {
+        // Ask screenrecord to finish properly; the termination of the
+        // recording task then pulls the file
+        [self runAdb:@[@"shell", @"pkill", @"-2", @"screenrecord"]
+            stdoutFile:nil
+                  done:nil];
+        return;
+    }
+
+    NSString *stamp = [self timestamp];
+    self.recordRemotePath =
+        [NSString stringWithFormat:@"/sdcard/scrcpy-rec-%@.mp4", stamp];
+    self.recordLocalPath = [self desktopPathForFile:
+        [NSString stringWithFormat:@"scrcpy-%@.mp4", stamp]];
+
+    // screenrecord stops by itself after the time limit (Android max is 180s)
+    self.recordTask = [self runAdb:@[@"shell", @"screenrecord",
+                                     @"--time-limit", @"180",
+                                     self.recordRemotePath]
+                        stdoutFile:nil
+                              done:^(int status, NSString *out, NSString *err) {
+        [self recordingFinished:status error:err];
+    }];
+    if (!self.recordTask) {
+        [self flash:@"Could not start recording"];
+        return;
+    }
+    [self setRecording:YES];
+}
+
+- (void)recordingFinished:(int)status error:(NSString *)err {
+    self.recordTask = nil;
+    [self setRecording:NO];
+
+    NSString *remote = self.recordRemotePath;
+    NSString *local = self.recordLocalPath;
+    // screenrecord exits with 130 on SIGINT, which is expected
+    if (status != 0 && status != 130 && status != 255) {
+        [self flash:[NSString stringWithFormat:@"Recording failed: %@", err]];
+        return;
+    }
+
+    [self flash:@"Saving recording…"];
+    [self runAdb:@[@"pull", remote, local]
+        stdoutFile:nil
+              done:^(int pullStatus, NSString *out, NSString *pullErr) {
+        [self runAdb:@[@"shell", @"rm", @"-f", remote] stdoutFile:nil done:nil];
+        if (pullStatus == 0) {
+            [self flash:[NSString stringWithFormat:
+                @"Recording saved on Desktop: %@", local.lastPathComponent]];
+        } else {
+            [self flash:@"Could not pull the recording"];
+        }
+    }];
+}
+
+#pragma mark - Developer tools menu
+
+- (void)toolsMenuItem:(NSMenuItem *)item {
+    NSString *key = item.representedObject;
+
+    if ([key isEqualToString:@"metro"]) {
+        [self runAdb:@[@"reverse", @"tcp:8081", @"tcp:8081"]
+            stdoutFile:nil
+                  done:^(int status, NSString *out, NSString *err) {
+            [self flash:status == 0
+                ? @"Metro reversed (device tcp:8081 → host tcp:8081)"
+                : @"adb reverse failed"];
+        }];
+    } else if ([key isEqualToString:@"cache"]) {
+        [self clearAppCache];
+    } else if ([key isEqualToString:@"url"]) {
+        [self openURLOnDevice];
+    } else if ([key isEqualToString:@"logcat"]) {
+        [self openLogcat];
+    } else if ([key isEqualToString:@"animations"]) {
+        [self runShell:@"case \"$(settings get global animator_duration_scale)\""
+                       @" in 0*) v=1;; *) v=0;; esac;"
+                       @" for k in window_animation_scale"
+                       @" transition_animation_scale animator_duration_scale;"
+                       @" do settings put global $k $v; done"
+               success:@"Animations toggled"
+            completion:nil];
+    } else if ([key isEqualToString:@"pointer"]) {
+        [self runShell:@"[ \"$(settings get system pointer_location)\" = 1 ]"
+                       @" && settings put system pointer_location 0"
+                       @" || settings put system pointer_location 1"
+               success:@"Pointer location toggled"
+            completion:nil];
+    } else if ([key isEqualToString:@"deviceinfo"]) {
+        [self runShell:@"echo \"Device: $(getprop ro.product.manufacturer)"
+                       @" $(getprop ro.product.model)\";"
+                       @" echo \"Android: $(getprop ro.build.version.release)"
+                       @" (API $(getprop ro.build.version.sdk))\";"
+                       @" wm size | head -1; wm density | head -1"
+               success:@"Device info copied"
+            completion:^(int status, NSString *out, NSString *err) {
+            if (status == 0) {
+                NSPasteboard *pb = [NSPasteboard generalPasteboard];
+                [pb clearContents];
+                [pb setString:trimmed(out) forType:NSPasteboardTypeString];
+            }
+        }];
+    } else if ([key isEqualToString:@"dark"]) {
+        [self runShell:@"cmd uimode night | grep -q yes"
+                       @" && cmd uimode night no || cmd uimode night yes"
+               success:@"Dark mode toggled"
+            completion:nil];
+    } else if ([key isEqualToString:@"touches"]) {
+        [self runShell:@"[ \"$(settings get system show_touches)\" = 1 ]"
+                       @" && settings put system show_touches 0"
+                       @" || settings put system show_touches 1"
+               success:@"Show touches toggled"
+            completion:nil];
+    } else if ([key isEqualToString:@"layout"]) {
+        [self runShell:@"[ \"$(getprop debug.layout)\" = true ]"
+                       @" && setprop debug.layout false"
+                       @" || setprop debug.layout true;"
+                       @" service call activity 1599295570"
+               success:@"Layout bounds toggled (may need an app refresh)"
+            completion:nil];
+    } else if ([key isEqualToString:@"devsettings"]) {
+        [self runShell:@"am start -a"
+                       @" android.settings.APPLICATION_DEVELOPMENT_SETTINGS"
+               success:@"Opened Developer options"
+            completion:nil];
+    } else if ([key isEqualToString:@"activity"]) {
+        [self runShell:@"dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'"
+               success:@"Foreground activity copied"
+            completion:^(int status, NSString *out, NSString *err) {
+            if (status != 0) {
+                return;
+            }
+            NSRegularExpression *re = [NSRegularExpression
+                regularExpressionWithPattern:
+                    @"([A-Za-z0-9_.]+)/([A-Za-z0-9_.$]+)"
+                                     options:0
+                                       error:nil];
+            NSTextCheckingResult *m =
+                [re firstMatchInString:out
+                               options:0
+                                 range:NSMakeRange(0, out.length)];
+            if (!m) {
+                [self flash:@"No foreground activity found"];
+                return;
+            }
+            NSString *activity = [out substringWithRange:m.range];
+            NSPasteboard *pb = [NSPasteboard generalPasteboard];
+            [pb clearContents];
+            [pb setString:activity forType:NSPasteboardTypeString];
+            [self flash:[NSString stringWithFormat:@"Copied: %@", activity]];
+        }];
+    }
+}
+
+// Menu of the "tools" button of the window: the developer tools and the
+// options that the menu bar also has
+- (NSMenu *)buildPopupMenu {
+    NSMenu *menu = [self buildToolsMenu];
+    [menu insertItem:[self itemWithTitle:@"App Manager…"
+                                  symbol:@"square.grid.2x2"
+                                  action:@selector(showAppManager:)
+                                     tag:0]
+             atIndex:0];
+    [menu insertItem:[self itemWithTitle:@"Device Info…"
+                                  symbol:@"gauge"
+                                  action:@selector(showDeviceInfo:)
+                                     tag:0]
+             atIndex:1];
+    [menu insertItem:[NSMenuItem separatorItem] atIndex:2];
+    [menu addItem:[NSMenuItem separatorItem]];
+    [self addSimulationItemsTo:menu];
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    [menu addItem:[self itemWithTitle:@"Keep Device Awake"
+                               symbol:@"sun.max"
+                               action:@selector(toggleKeepAwake:)
+                                  tag:0]];
+    [menu addItem:[self qualityMenuItem]];
+    [menu addItem:[self frameRateMenuItem]];
+    [menu addItem:[self audioMenuItem]];
+    [self addCopyIdItemsTo:menu];
+    [menu addItem:[self deviceInfoMenuItem]];
+    [self addFileItemsTo:menu];
+    [menu addItem:[self itemWithTitle:@"Turn Device Screen Off"
+                               symbol:@"moon.fill"
+                               action:@selector(buttonClicked:)
+                                  tag:SC_TOOLBAR_BUTTON_SCREEN_OFF]];
+    [menu addItem:[self itemWithTitle:@"Turn Device Screen On"
+                               symbol:@"sun.max"
+                               action:@selector(buttonClicked:)
+                                  tag:SC_TOOLBAR_BUTTON_SCREEN_ON]];
+    [menu addItem:[self itemWithTitle:@"Start With Device Screen Off"
+                               symbol:@"moon.zzz"
+                               action:@selector(toggleScreenOffOnStart:)
+                                  tag:0]];
+    [menu addItem:[self itemWithTitle:@"Toggle Auto-Rotate"
+                               symbol:@"lock.rotation"
+                               action:@selector(toggleAutoRotate:)
+                                  tag:0]];
+    [menu addItem:[self itemWithTitle:@"Keep Window on Top"
+                               symbol:@"pin"
+                               action:@selector(toggleKeepOnTop:)
+                                  tag:0]];
+    [menu addItem:[self scaleMenuItem]];
+
+    NSMenuItem *frame = [self itemWithTitle:@"Device Frame"
+                                     symbol:@"iphone.gen3"
+                                     action:nil
+                                        tag:0];
+    frame.submenu = [self buildFrameMenu];
+    [menu addItem:frame];
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    [menu addItem:[self itemWithTitle:@"Paste to Device"
+                               symbol:@"doc.on.clipboard"
+                               action:@selector(pasteToDevice:)
+                                  tag:0]];
+    [menu addItem:[self itemWithTitle:@"Type Clipboard as Keystrokes"
+                               symbol:@"keyboard"
+                               action:@selector(typeClipboard:)
+                                  tag:0]];
+    [menu addItem:[self itemWithTitle:@"Copy from Device"
+                               symbol:@"doc.on.doc"
+                               action:@selector(copyFromDevice:)
+                                  tag:0]];
+    [menu addItem:[NSMenuItem separatorItem]];
+    [self addWifiItemsTo:menu];
+    [self applyShortcutsToMenu:menu];
+    return menu;
+}
+
+// Menu of the "…" button, used when the bar is too narrow to show the React
+// Native buttons and the tools button
+- (NSMenu *)buildOverflowMenu {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Debug"];
+    [menu addItem:[self itemWithTitle:@"React Native developer menu"
+                               symbol:@"ladybug"
+                               action:@selector(buttonClicked:)
+                                  tag:SC_TOOLBAR_BUTTON_DEV_MENU]];
+    [menu addItem:[self itemWithTitle:@"Reload React Native"
+                               symbol:@"arrow.clockwise"
+                               action:@selector(buttonClicked:)
+                                  tag:SC_TOOLBAR_BUTTON_DEV_RELOAD]];
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    NSMenu *popup = [self buildPopupMenu];
+    NSArray *items = popup.itemArray;
+    [popup removeAllItems];
+    for (NSMenuItem *item in items) {
+        [menu addItem:item];
+    }
+    return menu;
+}
+
+- (NSMenu *)buildToolsMenu {
+    struct {
+        __unsafe_unretained NSString *title;
+        __unsafe_unretained NSString *key;
+        __unsafe_unretained NSString *symbol;
+    } defs[] = {
+        {@"Reverse Metro port (tcp:8081)", @"metro",
+            @"arrow.left.arrow.right"},
+        {@"Open URL / deep link…", @"url", @"link"},
+        {@"Clear app cache…", @"cache", @"trash"},
+        {@"Open logcat in Terminal", @"logcat", @"terminal"},
+        {@"Toggle animations", @"animations", @"film"},
+        {@"Toggle pointer location", @"pointer", @"scope"},
+        {@"Toggle dark mode", @"dark", @"moon.circle"},
+        {@"Toggle show touches", @"touches", @"hand.tap"},
+        {@"Toggle layout bounds", @"layout", @"rectangle.dashed"},
+        {@"Open Developer options", @"devsettings", @"gearshape.2"},
+        {@"Copy foreground activity", @"activity", @"doc.on.clipboard"},
+    };
+
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Developer tools"];
+    for (size_t i = 0; i < sizeof(defs) / sizeof(defs[0]); ++i) {
+        NSMenuItem *item =
+            [[NSMenuItem alloc] initWithTitle:defs[i].title
+                                       action:@selector(toolsMenuItem:)
+                                keyEquivalent:@""];
+        item.target = self;
+        item.representedObject = defs[i].key;
+        item.image = menu_image(defs[i].symbol, defs[i].title);
+        [menu addItem:item];
+    }
+    return menu;
+}
+
 @end
 
 #pragma mark - Drop target
