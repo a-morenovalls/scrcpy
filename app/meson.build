@@ -235,11 +235,22 @@ configure_file(configuration: conf, output: 'config.h')
 
 src_dir = include_directories('src')
 
+link_args = []
+objc_args = []
+if host_machine.system() == 'darwin'
+    add_languages('objc')
+    src += ['src/macos_toolbar.m']
+    link_args += ['-framework', 'AppKit']
+    objc_args += ['-fobjc-arc', '-Wno-unused-parameter']
+endif
+
 executable('scrcpy', src,
            dependencies: dependencies,
            include_directories: src_dir,
            install: true,
-           c_args: [])
+           c_args: [],
+           objc_args: objc_args,
+           link_args: link_args)
 
 # <https://mesonbuild.com/Builtin-options.html#directories>
 datadir = get_option('datadir') # by default 'share'
