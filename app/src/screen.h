@@ -2,6 +2,7 @@
 #define SC_SCREEN_H
 
 #include "common.h"
+#include "macos_toolbar.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -27,6 +28,15 @@
 #ifdef __APPLE__
 # define SC_DISPLAY_FORCE_OPENGL_CORE_PROFILE
 #endif
+
+// Hardware buttons of the phone frame (right side)
+enum sc_side_button {
+    SC_SIDE_NONE = -1,
+    SC_SIDE_VOLUME_UP = 0,
+    SC_SIDE_VOLUME_DOWN = 1,
+    SC_SIDE_POWER = 2,
+    SC_SIDE_COUNT = 3,
+};
 
 struct sc_screen {
     struct sc_frame_sink frame_sink; // frame sink trait
@@ -89,6 +99,36 @@ struct sc_screen {
     // rectangle of the content (excluding black borders)
     struct SDL_FRect rect;
     bool window_shown;
+    sc_tick shown_tick; // when the window was first shown
+
+    // Height (in window units) reserved at the bottom of the window for a
+    // native bar. The video is rendered in the remaining area (the "view").
+    uint16_t bottom_inset;
+
+    // Device frame drawn around the video (see sc_frame_style)
+    uint8_t frame_style;
+    // Space taken by the device frame around the video, in window units
+    uint16_t frame_pad_x;      // each side
+    uint16_t frame_pad_top;
+    uint16_t frame_pad_bottom;
+    int frame_shape;           // index of the profile, -1: follow the device
+    float frame_fs;            // scale of the frame (1 at the reference size)
+
+    // Hardware buttons drawn on the side of the phone frame
+    int side_hover;   // enum sc_side_button, or SC_SIDE_NONE
+    int side_pressed;
+    SDL_Cursor *side_cursor;
+
+    // Virtual fingers of the pinch-to-zoom gesture, drawn over the video
+    struct {
+        bool active;
+        float x; // position of the mouse (the first finger), in window units
+        float y;
+        bool invert_x; // the second finger is mirrored through the center
+        bool invert_y;
+        bool down;     // the gesture is in progress (left button pressed)
+    } pinch;
+    char device_model[64];  // ro.product.model, selects the frame shape
 
     // only accessed from the thread calling sc_frame_sink_ops functions
     struct sc_stream_session current_session;
@@ -150,6 +190,8 @@ struct sc_screen_params {
 
     bool fullscreen;
     bool start_fps_counter;
+
+    const char *serial; // used by the developer tools of the native toolbar
 };
 
 // initialize screen, create window, renderer and texture (window is hidden)
@@ -192,6 +234,33 @@ sc_screen_resize_to_pixel_perfect(struct sc_screen *screen);
 void
 sc_screen_set_orientation(struct sc_screen *screen,
                           enum sc_orientation orientation);
+
+// set the shape of phone drawn by the frame (-1: the one of the device)
+void
+sc_screen_set_frame_shape(struct sc_screen *screen, int shape);
+
+// scale the window (see enum sc_scale_mode)
+void
+sc_screen_scale(struct sc_screen *screen, enum sc_scale_mode mode,
+                float factor);
+
+// set the device frame drawn around the video (enum sc_frame_style)
+void
+sc_screen_set_frame_style(struct sc_screen *screen, uint8_t style);
+
+// side button of the phone frame at a point of the window (window units), or
+// SC_SIDE_NONE
+int
+sc_screen_side_button_at(struct sc_screen *screen, float x, float y);
+
+// hovered and pressed side buttons (SC_SIDE_NONE for none): redraws the frame
+void
+sc_screen_set_side_state(struct sc_screen *screen, int hover, int pressed);
+
+// show (or hide) the two virtual fingers of the pinch-to-zoom gesture
+void
+sc_screen_set_pinch(struct sc_screen *screen, bool active, float x, float y,
+                    bool invert_x, bool invert_y, bool down);
 
 // set the display pause state
 void
