@@ -978,6 +978,166 @@ normalized_address(NSString *input) {
     [self insertTopMenu:menu title:@"Developer"];
 }
 
+#pragma mark - Preferences
+
+static NSString *const kWindowPrefsKey = @"scrcpy.window";
+static NSString *const kFrameStyleKey = @"scrcpy.deviceFrame";
+
+// Other scrcpy sessions running (one process per device)
+static NSInteger
+other_session_count(void) {
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:@"/bin/ps"];
+    task.arguments = @[@"-axww", @"-o", @"pid=,args="];
+    NSPipe *pipe = [NSPipe pipe];
+    task.standardOutput = pipe;
+    task.standardError = NSFileHandle.fileHandleWithNullDevice;
+    if (![task launchAndReturnError:nil]) {
+        return 0;
+    }
+    NSData *data = [pipe.fileHandleForReading readDataToEndOfFile];
+    [task waitUntilExit];
+    NSString *out = [[NSString alloc] initWithData:data
+                                          encoding:NSUTF8StringEncoding];
+    NSInteger count = 0;
+    pid_t self_pid = getpid();
+    for (NSString *line in [out componentsSeparatedByString:@"\n"]) {
+        NSString *l = [line stringByTrimmingCharactersInSet:
+                          NSCharacterSet.whitespaceCharacterSet];
+        if ([l containsString:@"/scrcpy-bin"]
+                && [l integerValue] != self_pid) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static NSString *
+window_prefs_key_for_device(void) {
+    return g_controller.serial
+        ? [NSString stringWithFormat:@"%@.%@", kWindowPrefsKey,
+              g_controller.serial]
+        : nil;
+}
+
+// Each device remembers its own window. A device never seen before gets the
+// size of the last window, placed next to the other open sessions.
+void
+sc_prefs_load_window(struct sc_window_prefs *prefs) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *device_key = window_prefs_key_for_device();
+    NSDictionary *d = device_key ? [defaults dictionaryForKey:device_key]
+                                 : nil;
+    prefs->has_position = d != nil;
+    BOOL known_device = d != nil;
+    if (!d) {
+        d = [defaults dictionaryForKey:kWindowPrefsKey];
+    }
+    prefs->valid = d != nil;
+    if (!d) {
+        prefs->has_position = false;
+        return;
+    }
+    prefs->x = [d[@"x"] intValue];
+    prefs->y = [d[@"y"] intValue];
+    prefs->width = [d[@"w"] intValue];
+    prefs->height = [d[@"h"] intValue];
+    prefs->valid = prefs->width > 0 && prefs->height > 0;
+
+    if (!known_device) {
+        // Same place as the last window (the device may have changed of
+        // serial, USB <-> Wi-Fi), shifted if other sessions are open
+        NSInteger others = other_session_count();
+        prefs->has_position = true;
+        prefs->x += (int) (40 * others);
+        prefs->y += (int) (40 * others);
+    }
+}
+
+void
+sc_prefs_save_window(const struct sc_window_prefs *prefs) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSDictionary *d = @{
+        @"x": @(prefs->x), @"y": @(prefs->y),
+        @"w": @(prefs->width), @"h": @(prefs->height),
+    };
+    [defaults setObject:d forKey:kWindowPrefsKey];
+    NSString *device_key = window_prefs_key_for_device();
+    if (device_key) {
+        [defaults setObject:d forKey:device_key];
+    }
+}
+
+enum sc_frame_style
+sc_prefs_load_frame(void) {
+    NSInteger style = [[NSUserDefaults standardUserDefaults]
+                           integerForKey:kFrameStyleKey];
+    return style >= 0 && style < SC_FRAME_COUNT ? (enum sc_frame_style) style
+                                                : SC_FRAME_NONE;
+}
+
+void
+sc_macos_window_background(uint8_t rgb[3]) {
+    __block CGFloat r = 0, g = 0, b = 0;
+    void (^read)(void) = ^{
+        NSColor *c = [[NSColor windowBackgroundColor]
+            colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
+        [c getRed:&r green:&g blue:&b alpha:NULL];
+    };
+    if (@available(macOS 11.0, *)) {
+        [NSApp.effectiveAppearance performAsCurrentDrawingAppearance:read];
+    } else {
+        read();
+    }
+    rgb[0] = (uint8_t) lround(r * 255);
+    rgb[1] = (uint8_t) lround(g * 255);
+    rgb[2] = (uint8_t) lround(b * 255);
+}
+
+bool
+sc_macos_device_model(char *buf, size_t size) {
+    if (!g_controller) {
+        return false;
+    }
+    NSMutableArray *argv = [NSMutableArray arrayWithObject:g_controller.adb];
+    if (g_controller.serial) {
+        [argv addObjectsFromArray:@[@"-s", g_controller.serial]];
+    }
+    [argv addObjectsFromArray:@[@"shell", @"getprop", @"ro.product.model"]];
+
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/env"];
+    task.arguments = argv;
+    NSPipe *pipe = [NSPipe pipe];
+    task.standardOutput = pipe;
+    task.standardError = NSFileHandle.fileHandleWithNullDevice;
+    if (![task launchAndReturnError:nil]) {
+        return false;
+    }
+
+    // Do not block the startup if the device does not answer
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    task.terminationHandler = ^(NSTask *t) {
+        dispatch_semaphore_signal(done);
+    };
+    if (dispatch_semaphore_wait(
+            done, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC))) {
+        [task terminate];
+        return false;
+    }
+
+    NSData *data = [pipe.fileHandleForReading readDataToEndOfFile];
+    NSString *model = [[NSString alloc] initWithData:data
+                                            encoding:NSUTF8StringEncoding];
+    model = [model stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!model.length) {
+        return false;
+    }
+    snprintf(buf, size, "%s", model.UTF8String);
+    return true;
+}
+
 #pragma mark - Edit menu (clipboard)
 
 // Text of the Mac clipboard, if any
@@ -1166,6 +1326,227 @@ sc_macos_points_per_inch(SDL_Window *window) {
         }
     }
     return 110.f; // typical external display
+}
+
+#pragma mark - Window scale
+
+struct scale_def {
+    __unsafe_unretained NSString *identifier;
+    __unsafe_unretained NSString *title;
+    __unsafe_unretained NSString *symbol;
+    __unsafe_unretained NSString *spec;
+    enum sc_scale_mode mode;
+    float factor;
+};
+
+static const struct scale_def SCALE_DEFS[] = {
+    {@"physical", @"Physical Size", @"ruler", @"c+1", SC_SCALE_PHYSICAL, 1.f},
+    {@"point", @"Point Accurate (100%)", @"square.dashed", @"c+2",
+        SC_SCALE_POINT, 1.f},
+    {@"pixel", @"Pixel Accurate", @"squareshape.split.3x3", @"c+3",
+        SC_SCALE_PIXEL, 1.f},
+    {@"fit", @"Fit Screen", @"arrow.up.left.and.arrow.down.right", @"c+4",
+        SC_SCALE_FIT, 1.f},
+    {@"zoom_in", @"Zoom In", @"plus.magnifyingglass", @"c+=", SC_SCALE_STEP,
+        1.15f},
+    {@"zoom_out", @"Zoom Out", @"minus.magnifyingglass", @"c+-",
+        SC_SCALE_STEP, 1.f / 1.15f},
+    {@"z200", @"200%", @"magnifyingglass", @"o+c+1", SC_SCALE_ZOOM, 2.f},
+    {@"z150", @"150%", @"magnifyingglass", @"o+c+2", SC_SCALE_ZOOM, 1.5f},
+    {@"z75", @"75%", @"magnifyingglass", @"o+c+3", SC_SCALE_ZOOM, 0.75f},
+    {@"z50", @"50%", @"magnifyingglass", @"o+c+4", SC_SCALE_ZOOM, 0.5f},
+    {@"z33", @"33%", @"magnifyingglass", @"o+c+5", SC_SCALE_ZOOM, 0.33f},
+    {@"z25", @"25%", @"magnifyingglass", @"o+c+6", SC_SCALE_ZOOM, 0.25f},
+};
+
+- (void)scaleItem:(NSMenuItem *)item {
+    NSString *identifier = item.representedObject;
+    for (size_t i = 0; i < sizeof(SCALE_DEFS) / sizeof(SCALE_DEFS[0]); ++i) {
+        if ([SCALE_DEFS[i].identifier isEqualToString:identifier]) {
+            if (self.scaleCallback) {
+                self.scaleCallback(SCALE_DEFS[i].mode, SCALE_DEFS[i].factor,
+                                   self.userdata);
+            }
+            return;
+        }
+    }
+}
+
+- (NSMenuItem *)scaleMenuItem {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Scale"];
+    for (size_t i = 0; i < sizeof(SCALE_DEFS) / sizeof(SCALE_DEFS[0]); ++i) {
+        NSMenuItem *item = [self itemWithTitle:SCALE_DEFS[i].title
+                                        symbol:SCALE_DEFS[i].symbol
+                                        action:@selector(scaleItem:)
+                                           tag:0];
+        item.representedObject = SCALE_DEFS[i].identifier;
+        apply_shortcut(item, SCALE_DEFS[i].spec);
+        [menu addItem:item];
+        if (i == 3 || i == 5) {
+            [menu addItem:[NSMenuItem separatorItem]];
+        }
+    }
+    NSMenuItem *item = [self itemWithTitle:@"Scale"
+                                    symbol:@"arrow.up.left.and.arrow.down.right"
+                                    action:nil
+                                       tag:0];
+    item.submenu = menu;
+    return item;
+}
+
+#pragma mark - View menu (device frame)
+
+static NSString *const kFrameNames[SC_FRAME_COUNT] = {
+    [SC_FRAME_NONE] = @"None",
+    [SC_FRAME_PHONE_OBSIDIAN] = @"Phone — Obsidian",
+    [SC_FRAME_PHONE_PORCELAIN] = @"Phone — Porcelain",
+    [SC_FRAME_PHONE_HAZEL] = @"Phone — Hazel",
+    [SC_FRAME_PHONE_IRIS] = @"Phone — Iris",
+    [SC_FRAME_PHONE_PEONY] = @"Phone — Peony",
+    [SC_FRAME_THIN] = @"Thin border",
+    [SC_FRAME_PHONE_ROSE] = @"Phone — Rose",
+    [SC_FRAME_PHONE_MINT] = @"Phone — Mint",
+    [SC_FRAME_PHONE_BAY] = @"Phone — Bay",
+    [SC_FRAME_PHONE_JADE] = @"Phone — Jade",
+    [SC_FRAME_PHONE_LEMONGRASS] = @"Phone — Lemongrass",
+    [SC_FRAME_PHONE_SNOW] = @"Phone — Snow",
+    [SC_FRAME_PHONE_CORAL] = @"Phone — Coral",
+};
+
+- (void)selectFrame:(NSMenuItem *)item {
+    enum sc_frame_style style = (enum sc_frame_style) item.tag;
+    [[NSUserDefaults standardUserDefaults] setInteger:style
+                                               forKey:kFrameStyleKey];
+    if (self.frameCallback) {
+        self.frameCallback(style, self.userdata);
+    }
+}
+
+// Phone shapes: the model of the device, or a specific Pixel
+static NSString *const kFrameShapeKey = @"scrcpy.frameShape";
+
+void
+sc_prefs_load_shape(char *buf, size_t size) {
+    NSString *name = [[NSUserDefaults standardUserDefaults]
+                         stringForKey:kFrameShapeKey];
+    snprintf(buf, size, "%s", name.length ? name.UTF8String : "");
+}
+
+- (NSString *)currentShapeName {
+    return [[NSUserDefaults standardUserDefaults] stringForKey:kFrameShapeKey]
+        ?: @"";
+}
+
+// tag 0: follow the device; tag n: shape n - 1
+- (void)selectShape:(NSMenuItem *)item {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    int shape = (int) item.tag - 1;
+    if (shape < 0) {
+        [defaults removeObjectForKey:kFrameShapeKey];
+    } else {
+        [defaults setObject:@(sc_frame_shape_name(shape))
+                     forKey:kFrameShapeKey];
+    }
+    if (self.shapeCallback) {
+        self.shapeCallback(shape, self.userdata);
+    }
+}
+
+- (NSMenuItem *)shapeMenuItem {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Phone Shape"];
+    NSMenuItem *auto_item = [[NSMenuItem alloc]
+        initWithTitle:@"Auto (the model of the device)"
+               action:@selector(selectShape:)
+        keyEquivalent:@""];
+    auto_item.target = self;
+    auto_item.tag = 0;
+    [menu addItem:auto_item];
+    [menu addItem:[NSMenuItem separatorItem]];
+    for (int i = 0; i < sc_frame_shape_count(); ++i) {
+        NSMenuItem *item = [[NSMenuItem alloc]
+            initWithTitle:@(sc_frame_shape_name(i))
+                   action:@selector(selectShape:)
+            keyEquivalent:@""];
+        item.target = self;
+        item.tag = i + 1;
+        [menu addItem:item];
+    }
+    // Shortcuts: Ctrl+Shift+Opt+Cmd+F1...F12, then Ctrl+Opt+Cmd+F1...
+    for (NSMenuItem *item in menu.itemArray) {
+        if (item.action != @selector(selectShape:)) {
+            continue;
+        }
+        NSInteger n = item.tag; // 0, 1, 2...
+        apply_shortcut(item, n < 12
+            ? [NSString stringWithFormat:@"k+s+o+c+f%ld", (long) n + 1]
+            : [NSString stringWithFormat:@"k+o+c+f%ld", (long) n - 11]);
+    }
+    NSMenuItem *item = [self itemWithTitle:@"Phone Shape"
+                                    symbol:@"iphone.gen3.radiowaves.left.and.right"
+                                    action:nil
+                                       tag:0];
+    item.submenu = menu;
+    return item;
+}
+
+- (NSMenu *)buildFrameMenu {
+    NSMenu *frames = [[NSMenu alloc] initWithTitle:@"Device Frame"];
+    // None, the colors of the phone, then the thin border
+    const enum sc_frame_style order[] = {
+        SC_FRAME_NONE, SC_FRAME_PHONE_OBSIDIAN, SC_FRAME_PHONE_PORCELAIN,
+        SC_FRAME_PHONE_HAZEL, SC_FRAME_PHONE_IRIS, SC_FRAME_PHONE_PEONY,
+        SC_FRAME_PHONE_ROSE, SC_FRAME_PHONE_MINT, SC_FRAME_PHONE_BAY,
+        SC_FRAME_PHONE_JADE, SC_FRAME_PHONE_LEMONGRASS, SC_FRAME_PHONE_SNOW,
+        SC_FRAME_PHONE_CORAL, SC_FRAME_THIN,
+    };
+    for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); ++i) {
+        NSMenuItem *item =
+            [[NSMenuItem alloc] initWithTitle:kFrameNames[order[i]]
+                                       action:@selector(selectFrame:)
+                                keyEquivalent:@""];
+        item.target = self;
+        item.tag = order[i];
+        [frames addItem:item];
+        if (order[i] == SC_FRAME_NONE || order[i] == SC_FRAME_PHONE_CORAL) {
+            [frames addItem:[NSMenuItem separatorItem]];
+        }
+    }
+    [frames addItem:[NSMenuItem separatorItem]];
+    [frames addItem:[self shapeMenuItem]];
+    return frames;
+}
+
+- (void)installViewMenuItems {
+    NSMenu *main = NSApp.mainMenu;
+    if (!main) {
+        return;
+    }
+
+    NSMenu *frames = [self buildFrameMenu];
+
+    NSMenuItem *frame_item =
+        [[NSMenuItem alloc] initWithTitle:@"Device Frame"
+                                   action:nil
+                            keyEquivalent:@""];
+    frame_item.submenu = frames;
+    frame_item.image = menu_image(@"iphone.gen3", @"Device Frame");
+
+    NSMenu *view = [main itemWithTitle:@"View"].submenu;
+    if (!view) {
+        // No View menu: create one before the Window menu
+        view = [[NSMenu alloc] initWithTitle:@"View"];
+        NSMenuItem *top = [[NSMenuItem alloc] initWithTitle:@"View"
+                                                     action:nil
+                                              keyEquivalent:@""];
+        top.submenu = view;
+        NSInteger window_index =
+            [main indexOfItemWithSubmenu:NSApp.windowsMenu];
+        [main insertItem:top
+                 atIndex:window_index >= 0 ? window_index
+                                           : main.numberOfItems];
+    }
+    [view addItem:[NSMenuItem separatorItem]];
+    [view addItem:frame_item];
 }
 
 #pragma mark - Window menu
