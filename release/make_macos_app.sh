@@ -206,8 +206,11 @@ APP_PID=$$
 (
     START=$(date +%s)
     while kill -0 "$APP_PID" 2>/dev/null; do sleep 0.5; done
-    if (( $(date +%s) - START < 15 )) && grep -q '^ERROR' "$LOG" 2>/dev/null; then
-        MSG="$(grep '^ERROR' "$LOG" | head -6 | sed 's/"/\\"/g' | tr '\n' '|' | sed 's/|/\\n/g')"
+    # The network errors of the stream are a lost connection: the window stays
+    # open to reconnect, they are not a failure to start
+    ERRORS="$(grep '^ERROR' "$LOG" 2>/dev/null | grep -v -e 'Demuxer error' -e 'Controller error')"
+    if (( $(date +%s) - START < 15 )) && [[ -n "$ERRORS" ]]; then
+        MSG="$(printf '%s\n' "$ERRORS" | head -6 | sed 's/"/\\"/g' | tr '\n' '|' | sed 's/|/\\n/g')"
         osascript -e "display dialog \"scrcpy could not start:\\n\\n$MSG\" buttons {\"OK\"} default button \"OK\" with icon caution with title \"scrcpy\"" >/dev/null 2>&1
     fi
 ) >/dev/null 2>&1 &

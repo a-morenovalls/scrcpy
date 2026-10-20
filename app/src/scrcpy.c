@@ -117,6 +117,22 @@ sdl_configure_ctrl_c_windows(void) {
 }
 #endif // _WIN32
 
+// With the native bar, a network error of the stream is a lost connection (a
+// cable pulled, the Wi-Fi gone): the window stays open and offers to reconnect.
+// Return true if the window handled it as a disconnection.
+static bool
+connection_lost(struct scrcpy *s, bool has_screen) {
+    if (!has_screen || !s->screen.bottom_inset || !s->screen.window_shown
+            || s->screen.disconnected) {
+        return false;
+    }
+    SDL_Event event;
+    SDL_zero(event);
+    event.type = SC_EVENT_DEVICE_DISCONNECTED;
+    sc_screen_handle_event(&s->screen, &event);
+    return true;
+}
+
 static enum scrcpy_exit_code
 event_loop(struct scrcpy *s, bool has_screen) {
     SDL_Event event;
@@ -130,9 +146,15 @@ event_loop(struct scrcpy *s, bool has_screen) {
                 return SCRCPY_EXIT_DISCONNECTED;
             case SC_EVENT_DEMUXER_ERROR:
                 LOGE("Demuxer error");
+                if (connection_lost(s, has_screen)) {
+                    return SCRCPY_EXIT_DISCONNECTED;
+                }
                 return SCRCPY_EXIT_FAILURE;
             case SC_EVENT_CONTROLLER_ERROR:
                 LOGE("Controller error");
+                if (connection_lost(s, has_screen)) {
+                    return SCRCPY_EXIT_DISCONNECTED;
+                }
                 return SCRCPY_EXIT_FAILURE;
             case SC_EVENT_DECODER_ERROR:
                 LOGE("Decoder error");

@@ -133,6 +133,19 @@ sc_macos_toolbar_shutdown(void) {
 }
 #endif
 
+// The stream ended because the connection was lost (cable pulled, Wi-Fi gone,
+// switch between cable and Wi-Fi): the window stays open with a message, and the
+// device is looked for, by the same serial or by the other transport (USB or
+// Wi-Fi), to start the session again.
+#ifdef __APPLE__
+void
+sc_macos_connection_lost(void);
+#else
+static inline void
+sc_macos_connection_lost(void) {
+}
+#endif
+
 // Files dropped on the window: APKs are installed, the rest is sent to the
 // device. The hover callback shows (or hides) the drop target.
 #ifdef __APPLE__

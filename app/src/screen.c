@@ -2330,6 +2330,13 @@ sc_screen_handle_event(struct sc_screen *screen, const SDL_Event *event) {
             sc_texture_reset(&screen->tex);
             sc_screen_render(screen, true);
 
+            if (screen->bottom_inset) {
+                // The window stays open: the native layer shows a message and
+                // looks for the device (sc_screen_handle_disconnection())
+                sc_macos_connection_lost();
+                return;
+            }
+
             sc_tick deadline = sc_tick_now() + SC_TICK_FROM_SEC(2);
             static const struct sc_disconnect_callbacks cbs = {
                 .on_icon_loaded = sc_disconnect_on_icon_loaded,
@@ -2360,7 +2367,10 @@ sc_screen_handle_disconnection(struct sc_screen *screen) {
         return;
     }
 
-    if (!screen->disconnect_started) {
+    // With the native bar there is no timeout: the user (or the reconnection)
+    // ends the wait with a quit event
+    bool native = screen->bottom_inset > 0;
+    if (!native && !screen->disconnect_started) {
         // If sc_disconnect_start() failed, quit immediately
         return;
     }
@@ -2390,6 +2400,9 @@ sc_screen_handle_disconnection(struct sc_screen *screen) {
                 break;
             }
             case SC_EVENT_DISCONNECTED_TIMEOUT:
+                if (native) {
+                    break;
+                }
                 LOGD("Closing after device disconnection");
                 return;
             case SDL_EVENT_QUIT:

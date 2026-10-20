@@ -160,6 +160,17 @@ typedef void (^SCAdbDone)(int status, NSString *out, NSString *err);
 @property(nonatomic, copy) NSString *recordLocalPath;
 @property(nonatomic, assign) NSUInteger subtitleToken;
 @property(nonatomic, assign) BOOL screenOffUsed;
+// Lost connection
+@property(nonatomic, strong) NSView *connOverlay;
+@property(nonatomic, strong) NSTextField *connTitle;
+@property(nonatomic, strong) NSTextField *connDetail;
+@property(nonatomic, strong) NSProgressIndicator *connSpinner;
+@property(nonatomic, strong) NSTimer *connTimer;
+@property(nonatomic, assign) BOOL connBusy;
+@property(nonatomic, assign) BOOL connLost;
+@property(nonatomic, assign) NSUInteger connAttempts;
+@property(nonatomic, copy) NSString *hardwareSerial;
+@property(nonatomic, copy) NSString *wifiAddress;
 // Preferences window
 @property(nonatomic, strong) NSWindow *prefsWindow;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSControl *> *prefControls;
@@ -1903,20 +1914,23 @@ static NSString *const kQualityNames[] = {
 // The video settings are fixed when the session starts: restart it. The new
 // session is started by a detached helper once this one has quit, so that the
 // device settings restored on quit are not applied over the new session's.
-- (void)restartSession {
-    [self flash:@"Restarting the stream…"];
-
+- (void)restartSessionForSerial:(NSString *)serial {
     static NSString *const script =
         @"sleep 2; exec \"$1\" ${2:+-s \"$2\"}";
     NSTask *helper = [[NSTask alloc] init];
     helper.executableURL = [NSURL fileURLWithPath:@"/bin/sh"];
     helper.arguments = @[@"-c", script, @"sh", [self launcherPath],
-                         self.serial ?: @""];
+                         serial ?: @""];
     helper.standardOutput = NSFileHandle.fileHandleWithNullDevice;
     helper.standardError = NSFileHandle.fileHandleWithNullDevice;
     if ([helper launchAndReturnError:nil]) {
         [self quitCurrentSession];
     }
+}
+
+- (void)restartSession {
+    [self flash:@"Restarting the stream…"];
+    [self restartSessionForSerial:self.serial];
 }
 
 - (void)selectQuality:(NSMenuItem *)item {
@@ -4891,6 +4905,226 @@ live_info_text(NSDictionary *i) {
     }
 }
 
+#pragma mark - Lost connection
+
+// Identifiers of the device that survive a change of transport (cable or
+// Wi-Fi): its hardware serial, and its address on the Wi-Fi network
+- (void)fetchDeviceIdentity {
+    [self runAdb:@[@"shell",
+        (@"getprop ro.serialno;"
+         @" ip -f inet addr show wlan0 | sed -n 's/.*inet \\([0-9.]*\\).*/\\1/p'"
+         @" | head -1")]
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        NSArray *lines = [trimmed(out) componentsSeparatedByString:@"\n"];
+        if (status == 0 && lines.count >= 1) {
+            self.hardwareSerial = trimmed(lines[0]);
+        }
+        if (status == 0 && lines.count >= 2 && trimmed(lines[1]).length) {
+            self.wifiAddress = [NSString stringWithFormat:@"%@:%u",
+                trimmed(lines[1]), kDefaultTcpipPort];
+        }
+    }];
+}
+
+- (void)buildConnectionOverlay {
+    NSView *content = self.window.contentView;
+    NSVisualEffectView *dim = [[NSVisualEffectView alloc] initWithFrame:
+        NSMakeRect(0, SC_NAV_BAR_HEIGHT, content.bounds.size.width,
+                   content.bounds.size.height - SC_NAV_BAR_HEIGHT)];
+    dim.material = NSVisualEffectMaterialHUDWindow;
+    dim.blendingMode = NSVisualEffectBlendingModeWithinWindow;
+    dim.state = NSVisualEffectStateActive;
+    dim.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+
+    NSImageView *icon = [NSImageView imageViewWithImage:
+        menu_image(@"cable.connector.slash", @"Connection lost")
+            ?: [NSImage imageNamed:NSImageNameCaution]];
+    icon.symbolConfiguration = [NSImageSymbolConfiguration
+        configurationWithPointSize:34 weight:NSFontWeightRegular];
+    icon.contentTintColor = NSColor.systemOrangeColor;
+
+    NSTextField *title = [NSTextField labelWithString:@"Connection lost"];
+    title.font = [NSFont systemFontOfSize:17 weight:NSFontWeightSemibold];
+    NSTextField *detail = [NSTextField wrappingLabelWithString:@""];
+    detail.alignment = NSTextAlignmentCenter;
+    detail.textColor = NSColor.secondaryLabelColor;
+    detail.preferredMaxLayoutWidth = 260;
+
+    NSProgressIndicator *spinner = [[NSProgressIndicator alloc] init];
+    spinner.style = NSProgressIndicatorStyleSpinning;
+    spinner.controlSize = NSControlSizeSmall;
+    spinner.indeterminate = YES;
+    spinner.displayedWhenStopped = NO;
+
+    NSButton *retry = [NSButton buttonWithTitle:@"Retry Now"
+                                         target:self
+                                         action:@selector(connectionRetry:)];
+    retry.keyEquivalent = @"\r";
+    NSButton *close = [NSButton buttonWithTitle:@"Close"
+                                         target:self
+                                         action:@selector(connectionClose:)];
+    NSStackView *buttons = [NSStackView stackViewWithViews:@[retry, close]];
+    buttons.spacing = 10;
+
+    NSStackView *card = [NSStackView stackViewWithViews:
+        @[icon, title, detail, spinner, buttons]];
+    card.orientation = NSUserInterfaceLayoutOrientationVertical;
+    card.alignment = NSLayoutAttributeCenterX;
+    card.spacing = 10;
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    [dim addSubview:card];
+    [NSLayoutConstraint activateConstraints:@[
+        [card.centerXAnchor constraintEqualToAnchor:dim.centerXAnchor],
+        [card.centerYAnchor constraintEqualToAnchor:dim.centerYAnchor],
+        [card.widthAnchor constraintLessThanOrEqualToAnchor:dim.widthAnchor
+                                                   constant:-32],
+    ]];
+
+    [content addSubview:dim positioned:NSWindowAbove relativeTo:nil];
+    self.connOverlay = dim;
+    self.connTitle = title;
+    self.connDetail = detail;
+    self.connSpinner = spinner;
+}
+
+// Called when the stream ended without the user asking for it
+- (void)connectionLost {
+    if (self.connLost) {
+        return;
+    }
+    self.connLost = YES;
+    self.connAttempts = 0;
+    if (!self.connOverlay) {
+        [self buildConnectionOverlay];
+    }
+    BOOL wifi = [self isWifiSerial];
+    self.connTitle.stringValue = wifi ? @"Wi-Fi connection lost"
+                                      : @"Device disconnected";
+    NSString *where = self.wifiAddress && !wifi
+        ? [NSString stringWithFormat:@" or over Wi-Fi (%@)", self.wifiAddress]
+        : (wifi ? @" or by cable" : @"");
+    self.connDetail.stringValue = [NSString stringWithFormat:
+        @"Waiting for the device to come back%@. The stream restarts by itself "
+        @"when it is found.", where];
+    self.connOverlay.hidden = NO;
+    [self.connSpinner startAnimation:nil];
+    [self flash:@"Connection lost"];
+
+    __weak SCController *weak = self;
+    [self.connTimer invalidate];
+    self.connTimer = [NSTimer scheduledTimerWithTimeInterval:3
+                                                     repeats:YES
+                                                       block:^(NSTimer *timer) {
+        [weak pollReconnect];
+    }];
+    // First look soon: a Wi-Fi blip is usually back in a second
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        [weak pollReconnect];
+    });
+}
+
+- (void)connectionRetry:(id)sender {
+    self.connBusy = NO;
+    self.connDetail.stringValue = @"Looking for the device…";
+    [self pollReconnect];
+}
+
+- (void)connectionClose:(id)sender {
+    [self.connTimer invalidate];
+    self.connTimer = nil;
+    [self quitCurrentSession];
+}
+
+- (void)reconnectWith:(NSString *)serial {
+    [self.connTimer invalidate];
+    self.connTimer = nil;
+    self.connTitle.stringValue = @"Device found";
+    self.connDetail.stringValue = [NSString stringWithFormat:
+        @"Reconnecting through %@…", serial];
+    [self flash:[NSString stringWithFormat:@"Reconnecting through %@", serial]];
+    [self restartSessionForSerial:serial];
+}
+
+// Check the candidates one by one: the device may come back with the serial
+// it had, or through the other transport (it is then the same hardware serial)
+- (void)checkCandidates:(NSMutableArray<NSString *> *)candidates {
+    if (!candidates.count) {
+        [self tryWifiReconnect];
+        return;
+    }
+    NSString *candidate = candidates.firstObject;
+    [candidates removeObjectAtIndex:0];
+    if (!self.hardwareSerial.length) {
+        [self checkCandidates:candidates];
+        return;
+    }
+    [self runAdb:@[@"-s", candidate, @"shell", @"getprop ro.serialno"]
+        useSerial:NO
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        if (status == 0 && [trimmed(out) isEqualToString:self.hardwareSerial]) {
+            [self reconnectWith:candidate];
+        } else {
+            [self checkCandidates:candidates];
+        }
+    }];
+}
+
+// The cable is out but the device was in TCP mode: try its Wi-Fi address
+- (void)tryWifiReconnect {
+    if (!self.wifiAddress.length || [self.wifiAddress isEqualToString:self.serial]) {
+        self.connBusy = NO;
+        return;
+    }
+    NSTask *task = [self runAdb:@[@"connect", self.wifiAddress]
+                      useSerial:NO
+                     stdoutFile:nil
+                           done:^(int status, NSString *out, NSString *err) {
+        self.connBusy = NO;
+        if ([out containsString:@"connected to"]) {
+            [self reconnectWith:self.wifiAddress];
+        }
+    }];
+    // adb connect can wait a long time for a host that does not answer
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        if (task.isRunning) {
+            [task terminate];
+        }
+    });
+}
+
+- (void)pollReconnect {
+    if (!self.connLost || self.connBusy) {
+        return;
+    }
+    self.connBusy = YES;
+    self.connAttempts++;
+    [self runAdb:@[@"devices", @"-l"]
+        useSerial:NO
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        NSMutableArray<NSString *> *online = [NSMutableArray array];
+        for (NSString *line in [out componentsSeparatedByString:@"\n"]) {
+            NSArray *f = [[trimmed(line) componentsSeparatedByString:@" "]
+                filteredArrayUsingPredicate:
+                    [NSPredicate predicateWithFormat:@"length > 0"]];
+            if (f.count >= 2 && [f[1] isEqualToString:@"device"]) {
+                [online addObject:f[0]];
+            }
+        }
+        if (self.serial && [online containsObject:self.serial]) {
+            [self reconnectWith:self.serial]; // same serial: it is back
+            return;
+        }
+        self.connDetail.stringValue = [NSString stringWithFormat:
+            @"Looking for the device… (attempt %lu)", (unsigned long) self.connAttempts];
+        [self checkCandidates:online];
+    }];
+}
+
 #pragma mark - Preferences window
 
 static NSString *const kPrefCheckboxes[][2] = {
@@ -6269,6 +6503,11 @@ make_stack(NSArray<NSView *> *views) {
 // The window does not retain its toolbar delegate (see g_controller above)
 
 void
+sc_macos_connection_lost(void) {
+    [g_controller connectionLost];
+}
+
+void
 sc_macos_drop_file(const char *path) {
     [g_controller dropFile:@(path)];
 }
@@ -6315,6 +6554,7 @@ sc_macos_toolbar_init(SDL_Window *window, sc_toolbar_callback callback,
     g_controller.sdlWindow = window;
     [g_controller installEditMenu];
     [g_controller installPreferencesMenuItem];
+    [g_controller fetchDeviceIdentity];
     [g_controller installDeviceMenu];
     [g_controller installDeveloperMenu];
     [g_controller installViewMenuItems];
