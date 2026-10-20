@@ -2390,6 +2390,493 @@ install_failure_reason(NSString *out, NSString *err) {
                        [self transferFolder]]];
 }
 
+#pragma mark - Network, display and battery simulation
+
+static NSString *const kRestoreOnQuitKey = @"scrcpy.restoreOnQuit";
+static NSString *const kProxyKey = @"scrcpy.proxy";
+
+struct sim_def {
+    __unsafe_unretained NSString *identifier;
+    __unsafe_unretained NSString *title;
+    __unsafe_unretained NSString *symbol;
+    __unsafe_unretained NSString *spec; // shortcut, see apply_shortcut()
+    __unsafe_unretained NSString *command; // device shell, or "@handler"
+    __unsafe_unretained NSString *message;
+};
+
+#define SIM(...) {__VA_ARGS__}
+
+static const struct sim_def NETWORK_DEFS[] = {
+    SIM(@"proxy_set", @"Set Proxy…", @"network", @"k+s+o+c+p", @"@proxy", @""),
+    SIM(@"proxy_clear", @"Clear Proxy", @"network.slash", @"k+s+o+c+x",
+        @"settings put global http_proxy :0", @"Proxy cleared"),
+    SIM(@"proxy_show", @"Show Current Proxy", @"info.circle", @"k+s+o+c+u",
+        @"@proxy_show", @""),
+    SIM(@"wifi", @"Toggle Wi-Fi", @"wifi", @"k+s+o+c+w", @"@wifi", @""),
+    SIM(@"data", @"Toggle Mobile Data", @"antenna.radiowaves.left.and.right",
+        @"k+s+o+c+d",
+        @"[ \"$(settings get global mobile_data)\" = 1 ] && svc data disable"
+        @" || svc data enable", @"Mobile data toggled"),
+    SIM(@"airplane", @"Toggle Airplane Mode", @"airplane", @"k+s+o+c+a",
+        @"@airplane", @""),
+};
+
+static const struct sim_def SIZE_DEFS[] = {
+    SIM(@"size_720", @"720 × 1280 (HD)", @"rectangle.portrait", @"k+s+o+c+q",
+        @"wm size 720x1280", @"Screen size: 720 × 1280"),
+    SIM(@"size_1080", @"1080 × 1920 (Full HD 16:9)", @"rectangle.portrait",
+        @"k+s+o+c+e", @"wm size 1080x1920", @"Screen size: 1080 × 1920"),
+    SIM(@"size_2400", @"1080 × 2400 (20:9)", @"rectangle.portrait",
+        @"k+s+o+c+t", @"wm size 1080x2400", @"Screen size: 1080 × 2400"),
+    SIM(@"size_1440", @"1440 × 3120 (QHD+)", @"rectangle.portrait",
+        @"k+s+o+c+y", @"wm size 1440x3120", @"Screen size: 1440 × 3120"),
+    SIM(@"size_custom", @"Custom…", @"slider.horizontal.3", @"k+s+o+c+h",
+        @"@size_custom", @""),
+};
+
+static const struct sim_def DENSITY_DEFS[] = {
+    SIM(@"dpi_280", @"280 dpi", @"textformat.size", @"k+s+o+c+7",
+        @"wm density 280", @"Density: 280 dpi"),
+    SIM(@"dpi_320", @"320 dpi", @"textformat.size", @"k+s+o+c+8",
+        @"wm density 320", @"Density: 320 dpi"),
+    SIM(@"dpi_420", @"420 dpi", @"textformat.size", @"k+s+o+c+9",
+        @"wm density 420", @"Density: 420 dpi"),
+    SIM(@"dpi_480", @"480 dpi", @"textformat.size", @"k+s+o+c+0",
+        @"wm density 480", @"Density: 480 dpi"),
+    SIM(@"dpi_560", @"560 dpi", @"textformat.size", @"k+s+o+c+z",
+        @"wm density 560", @"Density: 560 dpi"),
+    SIM(@"dpi_custom", @"Custom…", @"slider.horizontal.3", @"k+s+o+c+j",
+        @"@density_custom", @""),
+};
+
+static const struct sim_def FONT_DEFS[] = {
+    SIM(@"font_085", @"Small (0.85×)", @"textformat", @"k+s+o+c+b",
+        @"settings put system font_scale 0.85", @"Font size: 0.85×"),
+    SIM(@"font_100", @"Default (1.0×)", @"textformat", @"k+s+o+c+c",
+        @"settings put system font_scale 1.0", @"Font size: 1.0×"),
+    SIM(@"font_115", @"Large (1.15×)", @"textformat", @"k+s+o+c+f",
+        @"settings put system font_scale 1.15", @"Font size: 1.15×"),
+    SIM(@"font_130", @"Larger (1.3×)", @"textformat", @"k+s+o+c+g",
+        @"settings put system font_scale 1.3", @"Font size: 1.3×"),
+    SIM(@"font_150", @"Largest (1.5×)", @"textformat", @"k+s+o+c+i",
+        @"settings put system font_scale 1.5", @"Font size: 1.5×"),
+    SIM(@"font_200", @"Huge (2.0×)", @"textformat", @"k+s+o+c+k",
+        @"settings put system font_scale 2.0", @"Font size: 2.0×"),
+};
+
+static const struct sim_def BATTERY_DEFS[] = {
+    SIM(@"level_100", @"Level 100%", @"battery.100", @"k+s+o+c+l",
+        @"dumpsys battery set level 100", @"Battery shown at 100%"),
+    SIM(@"level_50", @"Level 50%", @"battery.50", @"k+s+o+c+m",
+        @"dumpsys battery set level 50", @"Battery shown at 50%"),
+    SIM(@"level_20", @"Level 20% (low)", @"battery.25", @"k+s+o+c+n",
+        @"dumpsys battery set level 20", @"Battery shown at 20%"),
+    SIM(@"level_5", @"Level 5% (critical)", @"battery.0", @"k+s+o+c+s",
+        @"dumpsys battery set level 5", @"Battery shown at 5%"),
+    SIM(@"charging", @"Charging", @"battery.100.bolt", @"k+s+o+c+v",
+        @"dumpsys battery set ac 1", @"Showing the device as charging"),
+    SIM(@"unplug", @"Unplugged", @"battery.100", @"k+s+o+c+o",
+        @"dumpsys battery unplug", @"Showing the device as unplugged"),
+    SIM(@"saver_on", @"Battery Saver On", @"leaf", @"k+s+o+c+,",
+        @"cmd power set-mode 1", @"Battery saver on"),
+    SIM(@"saver_off", @"Battery Saver Off", @"leaf", @"k+s+o+c+.",
+        @"cmd power set-mode 0", @"Battery saver off"),
+    SIM(@"doze_on", @"Enter Doze", @"moon.zzz", @"k+s+o+c+/",
+        @"dumpsys deviceidle force-idle", @"Device forced into Doze"),
+    SIM(@"doze_off", @"Exit Doze", @"moon.zzz", @"k+s+o+c+;",
+        @"dumpsys deviceidle unforce", @"Doze released"),
+    SIM(@"battery_reset", @"Reset Battery Simulation", @"arrow.counterclockwise",
+        @"k+s+o+c+'", @"@battery_reset", @""),
+};
+
+static const struct sim_def *
+find_sim_def(NSString *identifier) {
+    static const struct {
+        const struct sim_def *defs;
+        size_t count;
+    } groups[] = {
+        {NETWORK_DEFS, sizeof(NETWORK_DEFS) / sizeof(NETWORK_DEFS[0])},
+        {SIZE_DEFS, sizeof(SIZE_DEFS) / sizeof(SIZE_DEFS[0])},
+        {DENSITY_DEFS, sizeof(DENSITY_DEFS) / sizeof(DENSITY_DEFS[0])},
+        {FONT_DEFS, sizeof(FONT_DEFS) / sizeof(FONT_DEFS[0])},
+        {BATTERY_DEFS, sizeof(BATTERY_DEFS) / sizeof(BATTERY_DEFS[0])},
+    };
+    for (size_t g = 0; g < sizeof(groups) / sizeof(groups[0]); ++g) {
+        for (size_t i = 0; i < groups[g].count; ++i) {
+            if ([groups[g].defs[i].identifier isEqualToString:identifier]) {
+                return &groups[g].defs[i];
+            }
+        }
+    }
+    return NULL;
+}
+
+// First private IPv4 address of this Mac (what the device must use as proxy)
+static NSString *
+mac_lan_ip(void) {
+    struct ifaddrs *list = NULL;
+    if (getifaddrs(&list) != 0) {
+        return nil;
+    }
+    NSString *found = nil;
+    for (struct ifaddrs *a = list; a && !found; a = a->ifa_next) {
+        if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET
+                || !(a->ifa_flags & IFF_UP) || (a->ifa_flags & IFF_LOOPBACK)
+                || strncmp(a->ifa_name, "en", 2) != 0) {
+            continue;
+        }
+        char buf[INET_ADDRSTRLEN];
+        struct sockaddr_in *sin = (struct sockaddr_in *) a->ifa_addr;
+        inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
+        if (strncmp(buf, "169.254.", 8) != 0) {
+            found = @(buf);
+        }
+    }
+    freeifaddrs(list);
+    return found;
+}
+
+- (BOOL)restoreOnQuit {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    return [defaults objectForKey:kRestoreOnQuitKey]
+        ? [defaults boolForKey:kRestoreOnQuitKey] : YES;
+}
+
+- (void)toggleRestoreOnQuit:(id)sender {
+    BOOL on = ![self restoreOnQuit];
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:kRestoreOnQuitKey];
+    [self flash:on ? @"Proxy, display and battery changes are undone on quit"
+                   : @"Proxy, display and battery changes stay after quitting"];
+}
+
+// Commands that give back what this session changed on the device
+- (NSArray<NSString *> *)restoreCommands {
+    NSMutableArray *commands = [NSMutableArray array];
+    if (self.displayOverridden) {
+        [commands addObject:@"wm size reset"];
+        [commands addObject:@"wm density reset"];
+        [commands addObject:[NSString stringWithFormat:
+            @"settings put system font_scale %@", self.fontOriginal ?: @"1.0"]];
+    }
+    if (self.batteryOverridden) {
+        [commands addObject:@"dumpsys battery reset"];
+        [commands addObject:@"dumpsys deviceidle unforce"];
+    }
+    if (self.saverOn) {
+        [commands addObject:@"cmd power set-mode 0"];
+    }
+    if (self.proxyOverridden) {
+        [commands addObject:@"settings put global http_proxy :0"];
+    }
+    return commands;
+}
+
+- (void)clearSimulationFlags {
+    self.displayOverridden = NO;
+    self.batteryOverridden = NO;
+    self.saverOn = NO;
+    self.proxyOverridden = NO;
+}
+
+// Ask before an action that would drop the Wi-Fi connection of this session
+- (void)confirmDisconnectingThen:(void (^)(void))action {
+    if (![self isWifiSerial]) {
+        action();
+        return;
+    }
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.alertStyle = NSAlertStyleWarning;
+    alert.messageText = @"This session is connected over Wi-Fi";
+    alert.informativeText = @"Turning the Wi-Fi of the device off disconnects "
+                            @"this window. Continue?";
+    [alert addButtonWithTitle:@"Continue"];
+    [alert addButtonWithTitle:@"Cancel"];
+    [alert beginSheetModalForWindow:self.window
+                  completionHandler:^(NSModalResponse response) {
+        if (response == NSAlertFirstButtonReturn) {
+            action();
+        }
+    }];
+}
+
+- (void)askProxy {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSDictionary *last = [defaults dictionaryForKey:kProxyKey];
+    NSString *mac_ip = mac_lan_ip();
+
+    NSTextField *host =
+        [[NSTextField alloc] initWithFrame:NSMakeRect(0, 52, 250, 24)];
+    host.stringValue = last[@"host"] ?: (mac_ip ?: @"");
+    host.placeholderString = @"192.168.1.20";
+    NSTextField *port =
+        [[NSTextField alloc] initWithFrame:NSMakeRect(262, 52, 78, 24)];
+    port.stringValue = last[@"port"] ?: @"8888";
+    port.placeholderString = @"8888";
+
+    NSView *accessory =
+        [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 340, 100)];
+    [accessory addSubview:host];
+    [accessory addSubview:port];
+    [accessory addSubview:[self labelWithText:@"Host"
+                                        frame:NSMakeRect(0, 80, 250, 18)]];
+    [accessory addSubview:[self labelWithText:@"Port"
+                                        frame:NSMakeRect(262, 80, 78, 18)]];
+    [accessory addSubview:[self labelWithText:
+        mac_ip ? [NSString stringWithFormat:
+                     @"This Mac: %@ (Charles 8888, Proxyman 9090, mitmproxy 8080)",
+                     mac_ip]
+               : @"Charles 8888, Proxyman 9090, mitmproxy 8080"
+                                        frame:NSMakeRect(0, 20, 340, 18)]];
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"Set HTTP Proxy on the Device";
+    alert.informativeText = @"All the HTTP traffic of the device goes through "
+                            @"this host, to inspect it on the Mac.";
+    alert.accessoryView = accessory;
+    [alert addButtonWithTitle:@"Set Proxy"];
+    [alert addButtonWithTitle:@"Cancel"];
+    [alert beginSheetModalForWindow:self.window
+                  completionHandler:^(NSModalResponse response) {
+        if (response != NSAlertFirstButtonReturn) {
+            return;
+        }
+        NSString *h = trimmed(host.stringValue);
+        NSInteger p = trimmed(port.stringValue).integerValue;
+        NSCharacterSet *bad = [NSCharacterSet characterSetWithCharactersInString:
+                                  @" '\"$`\\;&|<>"];
+        if (!h.length || p < 1 || p > 65535
+                || [h rangeOfCharacterFromSet:bad].location != NSNotFound) {
+            [self flash:@"Invalid proxy: type a host and a port (1–65535)"];
+            return;
+        }
+        [defaults setObject:@{@"host": h,
+                              @"port": [NSString stringWithFormat:@"%ld", (long) p]}
+                     forKey:kProxyKey];
+        self.proxyOverridden = YES;
+        [self runShell:[NSString stringWithFormat:
+                @"settings put global http_proxy %@:%ld", h, (long) p]
+               success:[NSString stringWithFormat:@"Proxy set: %@:%ld", h,
+                           (long) p]
+            completion:nil];
+    }];
+}
+
+// One value in a sheet (size "1080x2400", density "420")
+- (void)askValue:(NSString *)title
+         message:(NSString *)message
+     placeholder:(NSString *)placeholder
+         handler:(void (^)(NSString *value))handler {
+    NSTextField *field =
+        [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 300, 24)];
+    field.placeholderString = placeholder;
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = title;
+    alert.informativeText = message;
+    alert.accessoryView = field;
+    [alert addButtonWithTitle:@"Apply"];
+    [alert addButtonWithTitle:@"Cancel"];
+    alert.window.initialFirstResponder = field;
+    [alert beginSheetModalForWindow:self.window
+                  completionHandler:^(NSModalResponse response) {
+        if (response == NSAlertFirstButtonReturn) {
+            handler(trimmed(field.stringValue));
+        }
+    }];
+}
+
+- (void)runSimCommand:(NSString *)identifier
+              command:(NSString *)command
+              message:(NSString *)message {
+    if ([identifier hasPrefix:@"size_"] || [identifier hasPrefix:@"dpi_"]
+            || [identifier hasPrefix:@"font_"]) {
+        self.displayOverridden = YES;
+    } else if ([identifier hasPrefix:@"level_"]
+            || [identifier isEqualToString:@"charging"]
+            || [identifier isEqualToString:@"unplug"]
+            || [identifier hasPrefix:@"doze_"]) {
+        self.batteryOverridden = YES;
+    } else if ([identifier isEqualToString:@"saver_on"]) {
+        self.saverOn = YES;
+    } else if ([identifier isEqualToString:@"saver_off"]) {
+        self.saverOn = NO;
+    }
+    [self runShell:command success:message completion:nil];
+}
+
+- (void)simItem:(NSMenuItem *)item {
+    NSString *identifier = item.representedObject;
+    const struct sim_def *def = find_sim_def(identifier);
+    if (!def) {
+        return;
+    }
+    NSString *command = def->command;
+
+    if ([command isEqualToString:@"@proxy"]) {
+        [self askProxy];
+    } else if ([command isEqualToString:@"@proxy_show"]) {
+        [self runAdb:@[@"shell", @"settings get global http_proxy"]
+            stdoutFile:nil
+                  done:^(int status, NSString *out, NSString *err) {
+            NSString *value = trimmed(out);
+            BOOL none = !value.length || [value isEqualToString:@"null"]
+                     || [value isEqualToString:@":0"];
+            [self flash:none ? @"No proxy set on the device"
+                             : [NSString stringWithFormat:@"Proxy: %@", value]];
+        }];
+    } else if ([command isEqualToString:@"@wifi"]) {
+        [self confirmDisconnectingThen:^{
+            [self runShell:@"[ \"$(settings get global wifi_on)\" = 1 ]"
+                           @" && svc wifi disable || svc wifi enable"
+                   success:@"Wi-Fi toggled"
+                completion:nil];
+        }];
+    } else if ([command isEqualToString:@"@airplane"]) {
+        [self confirmDisconnectingThen:^{
+            [self runShell:@"[ \"$(settings get global airplane_mode_on)\" = 1 ]"
+                           @" && cmd connectivity airplane-mode disable"
+                           @" || cmd connectivity airplane-mode enable"
+                   success:@"Airplane mode toggled"
+                completion:nil];
+        }];
+    } else if ([command isEqualToString:@"@size_custom"]) {
+        [self askValue:@"Custom Screen Size"
+               message:@"Width × height in pixels, for example 1080x2400. The "
+                       @"window follows the new size."
+           placeholder:@"1080x2400"
+               handler:^(NSString *value) {
+            NSArray *p = [[value lowercaseString]
+                componentsSeparatedByString:@"x"];
+            NSInteger w = p.count == 2 ? [p[0] integerValue] : 0;
+            NSInteger h = p.count == 2 ? [p[1] integerValue] : 0;
+            if (w < 200 || h < 200 || w > 8000 || h > 8000) {
+                [self flash:@"Invalid size: use WIDTHxHEIGHT, like 1080x2400"];
+                return;
+            }
+            [self runSimCommand:@"size_custom"
+                        command:[NSString stringWithFormat:@"wm size %ldx%ld",
+                                    (long) w, (long) h]
+                        message:[NSString stringWithFormat:
+                                    @"Screen size: %ld × %ld", (long) w,
+                                    (long) h]];
+        }];
+    } else if ([command isEqualToString:@"@density_custom"]) {
+        [self askValue:@"Custom Screen Density"
+               message:@"Dots per inch, between 120 and 800 (a Pixel is 420)."
+           placeholder:@"420"
+               handler:^(NSString *value) {
+            NSInteger d = value.integerValue;
+            if (d < 120 || d > 800) {
+                [self flash:@"Invalid density: use a number from 120 to 800"];
+                return;
+            }
+            [self runSimCommand:@"dpi_custom"
+                        command:[NSString stringWithFormat:@"wm density %ld",
+                                    (long) d]
+                        message:[NSString stringWithFormat:@"Density: %ld dpi",
+                                    (long) d]];
+        }];
+    } else if ([command isEqualToString:@"@battery_reset"]) {
+        self.batteryOverridden = NO;
+        [self runShell:@"dumpsys battery reset; dumpsys deviceidle unforce"
+               success:@"Battery simulation reset"
+            completion:nil];
+    } else if ([identifier hasPrefix:@"font_"] && !self.fontOriginal) {
+        // Remember the real font size before the first change
+        [self runAdb:@[@"shell", @"settings get system font_scale"]
+            stdoutFile:nil
+                  done:^(int status, NSString *out, NSString *err) {
+            NSString *value = trimmed(out);
+            self.fontOriginal = (value.length && ![value isEqualToString:@"null"])
+                ? value : @"1.0";
+            [self runSimCommand:identifier command:command
+                        message:def->message];
+        }];
+    } else {
+        [self runSimCommand:identifier command:command message:def->message];
+    }
+}
+
+- (void)resetDisplay:(id)sender {
+    NSArray *commands = @[@"wm size reset", @"wm density reset",
+        [NSString stringWithFormat:@"settings put system font_scale %@",
+            self.fontOriginal ?: @"1.0"]];
+    self.displayOverridden = NO;
+    [self runShell:[commands componentsJoinedByString:@"; "]
+           success:@"Screen size, density and font size reset"
+        completion:nil];
+}
+
+- (NSMenu *)buildSimMenu:(NSString *)title
+                    defs:(const struct sim_def *)defs
+                   count:(size_t)count {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:title];
+    for (size_t i = 0; i < count; ++i) {
+        NSMenuItem *item = [self itemWithTitle:defs[i].title
+                                        symbol:defs[i].symbol
+                                        action:@selector(simItem:)
+                                           tag:0];
+        item.representedObject = defs[i].identifier;
+        apply_shortcut(item, defs[i].spec);
+        [menu addItem:item];
+    }
+    return menu;
+}
+
+- (NSMenuItem *)submenuItem:(NSString *)title
+                     symbol:(NSString *)symbol
+                       menu:(NSMenu *)menu {
+    NSMenuItem *item = [self itemWithTitle:title symbol:symbol action:nil tag:0];
+    item.submenu = menu;
+    return item;
+}
+
+#define SIM_MENU(menu_title, table) \
+    [self buildSimMenu:menu_title defs:table count:sizeof(table) / sizeof(table[0])]
+
+- (NSMenuItem *)networkMenuItem {
+    return [self submenuItem:@"Network" symbol:@"network"
+                        menu:SIM_MENU(@"Network", NETWORK_DEFS)];
+}
+
+- (NSMenuItem *)displayMenuItem {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Display"];
+    [menu addItem:[self submenuItem:@"Screen Size"
+                             symbol:@"rectangle.portrait"
+                               menu:SIM_MENU(@"Screen Size", SIZE_DEFS)]];
+    [menu addItem:[self submenuItem:@"Density"
+                             symbol:@"textformat.size"
+                               menu:SIM_MENU(@"Density", DENSITY_DEFS)]];
+    [menu addItem:[self submenuItem:@"Font Size"
+                             symbol:@"textformat"
+                               menu:SIM_MENU(@"Font Size", FONT_DEFS)]];
+    [menu addItem:[NSMenuItem separatorItem]];
+    NSMenuItem *reset = [self itemWithTitle:@"Reset Size, Density and Font"
+                                     symbol:@"arrow.counterclockwise"
+                                     action:@selector(resetDisplay:)
+                                        tag:0];
+    apply_shortcut(reset, @"k+s+o+c+r");
+    [menu addItem:reset];
+    return [self submenuItem:@"Display" symbol:@"display" menu:menu];
+}
+
+- (NSMenuItem *)batteryMenuItem {
+    return [self submenuItem:@"Battery and Power" symbol:@"battery.50"
+                        menu:SIM_MENU(@"Battery and Power", BATTERY_DEFS)];
+}
+
+// The three simulation menus plus the option that undoes them on quit
+- (void)addSimulationItemsTo:(NSMenu *)menu {
+    [menu addItem:[self networkMenuItem]];
+    [menu addItem:[self displayMenuItem]];
+    [menu addItem:[self batteryMenuItem]];
+    NSMenuItem *restore = [self itemWithTitle:@"Undo These Changes When Closing"
+                                       symbol:@"arrow.uturn.backward"
+                                       action:@selector(toggleRestoreOnQuit:)
+                                          tag:0];
+    apply_shortcut(restore, @"k+s+o+c+]");
+    [menu addItem:restore];
+}
+
 #pragma mark - Actions
 
 - (void)buttonClicked:(id)sender {
