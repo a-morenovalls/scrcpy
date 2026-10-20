@@ -1841,6 +1841,555 @@ static NSString *const kScreenOffOnStartKey = @"scrcpy.screenOffOnStart";
                    : @"Sessions will start with the device screen on"];
 }
 
+#pragma mark - Drag and drop (install APKs, send files)
+
+static NSString *const kTransferFolderKey = @"scrcpy.transferFolder";
+static NSString *const kTransferFolders[] = {
+    @"Download", @"Documents", @"Pictures", @"Movies", @"Music", @"DCIM",
+};
+#define TRANSFER_FOLDER_COUNT \
+    (sizeof(kTransferFolders) / sizeof(kTransferFolders[0]))
+
+static NSString *
+shell_quote(NSString *text) {
+    return [NSString stringWithFormat:@"'%@'",
+        [text stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]];
+}
+
+- (NSString *)transferFolder {
+    NSString *folder = [[NSUserDefaults standardUserDefaults]
+                            stringForKey:kTransferFolderKey];
+    for (NSUInteger i = 0; i < TRANSFER_FOLDER_COUNT; ++i) {
+        if ([kTransferFolders[i] isEqualToString:folder]) {
+            return folder;
+        }
+    }
+    return kTransferFolders[0];
+}
+
+static NSString *const kOpenAfterSendKey = @"scrcpy.openAfterSend";
+
+// On by default: a file sent to the device is opened there
+- (BOOL)openAfterSend {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    return [defaults objectForKey:kOpenAfterSendKey]
+        ? [defaults boolForKey:kOpenAfterSendKey] : YES;
+}
+
+- (void)toggleOpenAfterSend:(id)sender {
+    BOOL on = ![self openAfterSend];
+    [[NSUserDefaults standardUserDefaults] setBool:on
+                                            forKey:kOpenAfterSendKey];
+    [self flash:on ? @"A file sent to the device will be opened there"
+                   : @"Files sent to the device will not be opened"];
+}
+
+// MIME type from the extension (the common ones); nil lets Android decide
+static NSString *
+mime_type_for_extension(NSString *ext) {
+    static NSDictionary *types;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        types = @{
+            @"png": @"image/png", @"jpg": @"image/jpeg", @"jpeg": @"image/jpeg",
+            @"gif": @"image/gif", @"webp": @"image/webp", @"heic": @"image/heic",
+            @"bmp": @"image/bmp", @"svg": @"image/svg+xml",
+            @"mp4": @"video/mp4", @"mov": @"video/quicktime",
+            @"mkv": @"video/x-matroska", @"webm": @"video/webm",
+            @"mp3": @"audio/mpeg", @"m4a": @"audio/mp4", @"wav": @"audio/x-wav",
+            @"ogg": @"audio/ogg", @"flac": @"audio/flac",
+            @"pdf": @"application/pdf", @"txt": @"text/plain",
+            @"md": @"text/plain", @"log": @"text/plain",
+            @"json": @"application/json", @"csv": @"text/csv",
+            @"html": @"text/html", @"xml": @"text/xml",
+            @"zip": @"application/zip",
+            @"doc": @"application/msword",
+            @"docx": @"application/vnd.openxmlformats-officedocument."
+                     @"wordprocessingml.document",
+            @"xls": @"application/vnd.ms-excel",
+            @"xlsx": @"application/vnd.openxmlformats-officedocument."
+                     @"spreadsheetml.sheet",
+            @"ppt": @"application/vnd.ms-powerpoint",
+            @"pptx": @"application/vnd.openxmlformats-officedocument."
+                     @"presentationml.presentation",
+        };
+    });
+    return types[ext.lowercaseString];
+}
+
+// Open a file of the device with the app that handles it. The MediaStore URI
+// (content://) is preferred: the apps can't always read a plain file:// path
+// with the storage restrictions of recent Android versions.
+- (void)openOnDevice:(NSString *)remote {
+    NSString *name = remote.lastPathComponent;
+    NSString *mime = mime_type_for_extension(remote.pathExtension);
+    NSString *type_arg = mime ? [@" -t " stringByAppendingString:mime] : @"";
+    NSString *file_view = [NSString stringWithFormat:
+        @"am start -a android.intent.action.VIEW -d %@%@",
+        shell_quote([@"file://" stringByAppendingString:remote]), type_arg];
+
+    NSCharacterSet *unsafe =
+        [NSCharacterSet characterSetWithCharactersInString:@"'\"$`\\"];
+    NSString *script = file_view;
+    if ([remote rangeOfCharacterFromSet:unsafe].location == NSNotFound) {
+        NSString *canonical = [remote hasPrefix:@"/sdcard/"]
+            ? [@"/storage/emulated/0/" stringByAppendingString:
+                  [remote substringFromIndex:8]] : remote;
+        // The media scanner is asynchronous: wait for the file to be indexed
+        script = [NSString stringWithFormat:
+            @"for i in 1 2 3 4 5 6; do"
+            @" id=$(content query --uri content://media/external/file"
+            @" --projection _id --where \"_data='%@'\" 2>/dev/null"
+            @" | sed -n 's/.*_id=\\([0-9]*\\).*/\\1/p' | head -1);"
+            @" [ -n \"$id\" ] && break; sleep 0.4; done;"
+            @" if [ -n \"$id\" ]; then"
+            @" am start -a android.intent.action.VIEW"
+            @" -d content://media/external/file/$id%@"
+            @" --grant-read-uri-permission; else %@; fi",
+            canonical, type_arg, file_view];
+    }
+
+    [self runAdb:@[@"shell", script]
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        if (status == 0 && ![out containsString:@"Error"]) {
+            [self flash:[NSString stringWithFormat:@"Opened %@ on the device",
+                            name]];
+        } else {
+            [self flash:[NSString stringWithFormat:
+                            @"No app on the device can open %@", name]];
+        }
+    }];
+}
+
+static NSString *const kGrantPermissionsKey = @"scrcpy.grantPermissions";
+
+- (BOOL)grantPermissions {
+    return [[NSUserDefaults standardUserDefaults]
+                boolForKey:kGrantPermissionsKey];
+}
+
+// Off by default: an APK dropped on the window does not get every permission
+- (void)toggleGrantPermissions:(id)sender {
+    BOOL on = ![self grantPermissions];
+    [[NSUserDefaults standardUserDefaults] setBool:on
+                                            forKey:kGrantPermissionsKey];
+    [self flash:on ? @"Installed apps will get all their permissions"
+                   : @"Installed apps will ask for their permissions"];
+}
+
+- (void)selectTransferFolder:(NSMenuItem *)item {
+    [[NSUserDefaults standardUserDefaults]
+        setObject:kTransferFolders[item.tag] forKey:kTransferFolderKey];
+    [self flash:[NSString stringWithFormat:@"Files will be sent to /sdcard/%@",
+                    kTransferFolders[item.tag]]];
+}
+
+- (NSMenuItem *)transferFolderMenuItem {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Transfer Folder"];
+    for (NSUInteger i = 0; i < TRANSFER_FOLDER_COUNT; ++i) {
+        NSMenuItem *item = [[NSMenuItem alloc]
+            initWithTitle:[NSString stringWithFormat:@"/sdcard/%@",
+                              kTransferFolders[i]]
+                   action:@selector(selectTransferFolder:)
+            keyEquivalent:@""];
+        item.target = self;
+        item.tag = i;
+        [menu addItem:item];
+    }
+    NSMenuItem *item = [self itemWithTitle:@"Transfer Folder"
+                                    symbol:@"folder"
+                                    action:nil
+                                       tag:0];
+    item.submenu = menu;
+    return item;
+}
+
+// Show a status that stays until the next message (no timeout)
+- (void)showProgress:(NSString *)message {
+    if (@available(macOS 11.0, *)) {
+        ++self.subtitleToken; // keeps the previous messages from clearing it
+        self.window.subtitle = message;
+    }
+}
+
+// Drop target shown while a file is dragged over the window
+- (void)setDropHover:(BOOL)on {
+    self.dropLabel.stringValue = [NSString stringWithFormat:
+        @"Drop to install APKs\nor send files to /sdcard/%@",
+        [self transferFolder]];
+    self.dropOverlay.hidden = !on;
+}
+
+// Files may arrive one by one: wait a moment to take them as one batch
+- (void)dropFile:(NSString *)path {
+    if (!self.dropQueue) {
+        self.dropQueue = [NSMutableArray array];
+    }
+    [self.dropQueue addObject:path];
+    NSUInteger token = ++self.dropToken;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        if (token == self.dropToken && !self.dropBusy) {
+            [self startDropBatch];
+        }
+    });
+}
+
+- (void)startDropBatch {
+    if (!self.dropQueue.count) {
+        return;
+    }
+    self.dropBusy = YES;
+    self.dropTotal = self.dropQueue.count;
+    self.dropIndex = 0;
+    self.dropInstalled = 0;
+    self.dropSent = 0;
+    self.dropFailures = [NSMutableArray array];
+    self.dropDowngrades = [NSMutableArray array];
+    self.dropSentFiles = [NSMutableArray array];
+    [self processNextDrop];
+}
+
+// Install reason: "Failure [INSTALL_FAILED_...]"
+static NSString *
+install_failure_reason(NSString *out, NSString *err) {
+    NSString *text = [out stringByAppendingString:err];
+    NSRegularExpression *re = [NSRegularExpression
+        regularExpressionWithPattern:@"Failure \\[([^\\]]+)\\]"
+                             options:0
+                               error:nil];
+    NSTextCheckingResult *m = [re firstMatchInString:text
+                                             options:0
+                                               range:NSMakeRange(0, text.length)];
+    if (m) {
+        // "INSTALL_FAILED_X: details" -> "INSTALL_FAILED_X"
+        return [[[text substringWithRange:[m rangeAtIndex:1]]
+            componentsSeparatedByString:@":"] firstObject];
+    }
+    NSString *line = trimmed(text.length ? text : @"unknown error");
+    return [[line componentsSeparatedByString:@"\n"] lastObject];
+}
+
+- (void)finishDropFile:(NSString *)name
+                  kind:(NSString *)kind
+                    ok:(BOOL)ok
+                reason:(NSString *)reason
+                  path:(NSString *)path {
+    if (ok) {
+        if ([kind isEqualToString:@"install"]) {
+            self.dropInstalled++;
+        } else {
+            self.dropSent++;
+        }
+    } else {
+        [self.dropFailures addObject:[NSString stringWithFormat:@"%@: %@",
+                                         name, reason]];
+        if ([reason containsString:@"VERSION_DOWNGRADE"]) {
+            [self.dropDowngrades addObject:path];
+        }
+    }
+    [self processNextDrop];
+}
+
+- (void)processNextDrop {
+    if (!self.dropQueue.count) {
+        [self finishDropBatch];
+        return;
+    }
+    NSString *path = self.dropQueue.firstObject;
+    [self.dropQueue removeObjectAtIndex:0];
+    self.dropIndex++;
+
+    NSString *name = path.lastPathComponent;
+    NSString *ext = path.pathExtension.lowercaseString;
+    NSString *counter = self.dropTotal > 1
+        ? [NSString stringWithFormat:@" (%lu/%lu)", (unsigned long) self.dropIndex,
+              (unsigned long) self.dropTotal] : @"";
+
+    if ([ext isEqualToString:@"apk"]) {
+        [self showProgress:[NSString stringWithFormat:@"Installing %@%@…", name,
+                               counter]];
+        [self installAPKs:@[path] extraFlags:@[] name:name path:path];
+    } else if ([ext isEqualToString:@"apks"] || [ext isEqualToString:@"xapk"]) {
+        [self showProgress:[NSString stringWithFormat:@"Installing %@%@…", name,
+                               counter]];
+        [self installBundle:path];
+    } else {
+        [self showProgress:[NSString stringWithFormat:@"Sending %@%@…", name,
+                               counter]];
+        [self sendFile:path];
+    }
+}
+
+- (void)installAPKs:(NSArray<NSString *> *)apks
+         extraFlags:(NSArray<NSString *> *)flags
+               name:(NSString *)name
+               path:(NSString *)path {
+    NSMutableArray *args = [NSMutableArray arrayWithObject:
+        apks.count > 1 ? @"install-multiple" : @"install"];
+    [args addObjectsFromArray:@[@"-r", @"-t"]];
+    if ([self grantPermissions]) {
+        [args addObject:@"-g"];
+    }
+    if (self.dropDowngradeMode) {
+        [args addObject:@"-d"];
+    }
+    [args addObjectsFromArray:flags];
+    [args addObjectsFromArray:apks];
+    [self runAdb:args
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        BOOL ok = status == 0 && [out containsString:@"Success"];
+        [self finishDropFile:name
+                        kind:@"install"
+                          ok:ok
+                      reason:ok ? @"" : install_failure_reason(out, err)
+                        path:path];
+    }];
+}
+
+// .apks (bundletool) and .xapk are zip files of split APKs
+- (void)installBundle:(NSString *)path {
+    NSString *name = path.lastPathComponent;
+    NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:
+        [@"scrcpy-bundle-" stringByAppendingString:
+            [NSUUID UUID].UUIDString]];
+    NSTask *unzip = [[NSTask alloc] init];
+    unzip.executableURL = [NSURL fileURLWithPath:@"/usr/bin/ditto"];
+    unzip.arguments = @[@"-x", @"-k", path, dir];
+    unzip.standardError = NSFileHandle.fileHandleWithNullDevice;
+    NSError *error = nil;
+    if (![unzip launchAndReturnError:&error]) {
+        [self finishDropFile:name kind:@"install" ok:NO
+                      reason:@"could not unzip" path:path];
+        return;
+    }
+    [unzip waitUntilExit];
+
+    // The APKs of the bundle: splits/ for .apks, the root for .xapk
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray<NSString *> *apks = [NSMutableArray array];
+    NSMutableArray<NSString *> *all = [NSMutableArray array];
+    for (NSString *relative in [fm enumeratorAtPath:dir]) {
+        if (![relative.pathExtension.lowercaseString isEqualToString:@"apk"]) {
+            continue;
+        }
+        NSString *full = [dir stringByAppendingPathComponent:relative];
+        [all addObject:full];
+        BOOL in_splits = [relative hasPrefix:@"splits/"];
+        BOOL in_root = ![relative containsString:@"/"];
+        if (in_splits || in_root) {
+            [apks addObject:full];
+        }
+    }
+    if (!apks.count) {
+        apks = all;
+    }
+    if (!apks.count) {
+        [fm removeItemAtPath:dir error:nil];
+        [self finishDropFile:name kind:@"install" ok:NO
+                      reason:@"no APK found inside" path:path];
+        return;
+    }
+
+    NSMutableArray *args = [NSMutableArray arrayWithObject:@"install-multiple"];
+    [args addObjectsFromArray:@[@"-r", @"-t"]];
+    if ([self grantPermissions]) {
+        [args addObject:@"-g"];
+    }
+    if (self.dropDowngradeMode) {
+        [args addObject:@"-d"];
+    }
+    [args addObjectsFromArray:apks];
+    [self runAdb:args
+        stdoutFile:nil
+              done:^(int status, NSString *out, NSString *err) {
+        BOOL ok = status == 0 && [out containsString:@"Success"];
+        if (ok) {
+            // .xapk may carry expansion files: Android/obb/<package>/
+            NSString *obb = [dir stringByAppendingPathComponent:@"Android/obb"];
+            for (NSString *package in [fm contentsOfDirectoryAtPath:obb
+                                                              error:nil]) {
+                [self runAdb:@[@"push",
+                               [obb stringByAppendingPathComponent:package],
+                               @"/sdcard/Android/obb/"]
+                    stdoutFile:nil
+                          done:nil];
+            }
+        }
+        // The OBB push is asynchronous: leave the files for a while
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_SEC),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            [[NSFileManager defaultManager] removeItemAtPath:dir error:nil];
+        });
+        [self finishDropFile:name
+                        kind:@"install"
+                          ok:ok
+                      reason:ok ? @"" : install_failure_reason(out, err)
+                        path:path];
+    }];
+}
+
+- (void)sendFile:(NSString *)path {
+    NSString *name = path.lastPathComponent;
+    NSString *target = [NSString stringWithFormat:@"/sdcard/%@/",
+                           [self transferFolder]];
+    [self runAdb:@[@"shell", [@"mkdir -p " stringByAppendingString:
+                                 shell_quote(target)]]
+        stdoutFile:nil
+              done:^(int mkdirStatus, NSString *mkOut, NSString *mkErr) {
+        [self runAdb:@[@"push", path, target]
+            stdoutFile:nil
+                  done:^(int status, NSString *out, NSString *err) {
+            BOOL ok = status == 0;
+            if (ok) {
+                // Make it show up in the gallery and the file apps
+                NSString *remote = [target stringByAppendingString:name];
+                [self runAdb:@[@"shell",
+                    [NSString stringWithFormat:
+                        @"am broadcast -a "
+                        @"android.intent.action.MEDIA_SCANNER_SCAN_FILE -d %@",
+                        shell_quote([@"file://" stringByAppendingString:
+                                        remote])]]
+                    stdoutFile:nil
+                          done:nil];
+            }
+            NSString *reason = trimmed(err.length ? err : out);
+            BOOL is_dir = NO;
+            [[NSFileManager defaultManager] fileExistsAtPath:path
+                                                 isDirectory:&is_dir];
+            if (ok && !is_dir) {
+                [self.dropSentFiles addObject:@{
+                    @"remote": [target stringByAppendingString:name]}];
+            }
+            [self finishDropFile:name
+                            kind:@"send"
+                              ok:ok
+                          reason:reason
+                            path:path];
+        }];
+    }];
+}
+
+- (void)finishDropBatch {
+    self.dropBusy = NO;
+    self.dropDowngradeMode = NO;
+    NSMutableArray *parts = [NSMutableArray array];
+    if (self.dropInstalled) {
+        [parts addObject:[NSString stringWithFormat:@"installed %lu app%@",
+            (unsigned long) self.dropInstalled,
+            self.dropInstalled == 1 ? @"" : @"s"]];
+    }
+    if (self.dropSent) {
+        [parts addObject:[NSString stringWithFormat:
+            @"sent %lu file%@ to /sdcard/%@", (unsigned long) self.dropSent,
+            self.dropSent == 1 ? @"" : @"s", [self transferFolder]]];
+    }
+    NSString *summary = [parts componentsJoinedByString:@", "];
+    NSString *ok_text = summary.length
+        ? [[summary substringToIndex:1].uppercaseString
+              stringByAppendingString:[summary substringFromIndex:1]]
+        : @"";
+
+    // Debug: SCRCPY_TEST_DROP_LOG=<file> gets the result of each batch
+    const char *log_path = getenv("SCRCPY_TEST_DROP_LOG");
+    if (log_path) {
+        NSString *line = [NSString stringWithFormat:@"%@ | failures: %@\n",
+            summary.length ? summary : @"nothing",
+            [self.dropFailures componentsJoinedByString:@" ; "]];
+        NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:@(log_path)];
+        if (!h) {
+            [[NSFileManager defaultManager] createFileAtPath:@(log_path)
+                                                    contents:nil attributes:nil];
+            h = [NSFileHandle fileHandleForWritingAtPath:@(log_path)];
+        }
+        [h seekToEndOfFile];
+        [h writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [h closeFile];
+    }
+    // A single file sent: open it on the device
+    if ([self openAfterSend] && self.dropSentFiles.count == 1
+            && !self.dropInstalled && !self.dropFailures.count) {
+        [self openOnDevice:self.dropSentFiles.firstObject[@"remote"]];
+        return;
+    }
+    if (!self.dropFailures.count) {
+        [self flash:ok_text.length ? ok_text : @"Nothing to do"];
+        return;
+    }
+
+    [self flash:[NSString stringWithFormat:@"%@%lu failed",
+                    ok_text.length ? [ok_text stringByAppendingString:@" · "]
+                                   : @"", (unsigned long) self.dropFailures.count]];
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.alertStyle = NSAlertStyleWarning;
+    alert.messageText = @"Some files could not be transferred";
+    alert.informativeText = [self.dropFailures componentsJoinedByString:@"\n"];
+    [alert addButtonWithTitle:@"OK"];
+    NSArray<NSString *> *downgrades = [self.dropDowngrades copy];
+    if (downgrades.count) {
+        [alert addButtonWithTitle:@"Install Anyway (downgrade)"];
+    }
+    [alert beginSheetModalForWindow:self.window
+                  completionHandler:^(NSModalResponse response) {
+        if (response == NSAlertSecondButtonReturn && downgrades.count) {
+            [self.dropQueue addObjectsFromArray:downgrades];
+            self.dropBusy = YES;
+            self.dropTotal = downgrades.count;
+            self.dropIndex = 0;
+            self.dropInstalled = 0;
+            self.dropSent = 0;
+            self.dropFailures = [NSMutableArray array];
+            self.dropDowngrades = [NSMutableArray array];
+            self.dropDowngradeMode = YES;
+            [self processNextDrop];
+        }
+    }];
+}
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+- (void)chooseFilesFor:(NSArray<NSString *> *)types
+                 title:(NSString *)title {
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.message = title;
+    panel.allowsMultipleSelection = YES;
+    panel.canChooseFiles = YES;
+    panel.canChooseDirectories = !types;
+    if (types) {
+        panel.allowedFileTypes = types;
+    }
+    [panel beginSheetModalForWindow:self.window
+                  completionHandler:^(NSModalResponse response) {
+        if (response != NSModalResponseOK) {
+            return;
+        }
+        if (!self.dropQueue) {
+            self.dropQueue = [NSMutableArray array];
+        }
+        for (NSURL *url in panel.URLs) {
+            [self.dropQueue addObject:url.path];
+        }
+        if (!self.dropBusy) {
+            [self startDropBatch];
+        }
+    }];
+}
+#pragma clang diagnostic pop
+
+- (void)installAPKItem:(id)sender {
+    [self chooseFilesFor:@[@"apk", @"apks", @"xapk"]
+                   title:@"Choose the apps to install on the device"];
+}
+
+- (void)sendFilesItem:(id)sender {
+    [self chooseFilesFor:nil
+                   title:[NSString stringWithFormat:
+                       @"Choose the files to send to /sdcard/%@",
+                       [self transferFolder]]];
+}
+
 #pragma mark - Actions
 
 - (void)buttonClicked:(id)sender {
@@ -2044,6 +2593,35 @@ static NSString *const kScreenOffOnStartKey = @"scrcpy.screenOffOnStart";
             @"Screenshot saved on Desktop and copied: %@",
             path.lastPathComponent]];
     }];
+}
+
+@end
+
+#pragma mark - Drop target
+
+// Highlight shown while a file is dragged over the window. It ignores the mouse
+// (hitTest returns nil), the events reach the SDL view.
+@interface SCDropOverlay : NSView
+@end
+
+@implementation SCDropOverlay
+
+- (NSView *)hitTest:(NSPoint)point {
+    return nil;
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    NSRect r = NSInsetRect(self.bounds, 14, 14);
+    NSBezierPath *path = [NSBezierPath bezierPathWithRoundedRect:r
+                                                         xRadius:28
+                                                         yRadius:28];
+    [[NSColor.controlAccentColor colorWithAlphaComponent:0.16] setFill];
+    [path fill];
+    [NSColor.controlAccentColor setStroke];
+    path.lineWidth = 3;
+    const CGFloat dash[] = {10, 7};
+    [path setLineDash:dash count:2 phase:0];
+    [path stroke];
 }
 
 @end
