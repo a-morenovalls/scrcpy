@@ -168,6 +168,8 @@ typedef void (^SCAdbDone)(int status, NSString *out, NSString *err);
 @property(nonatomic, strong) NSTimer *connTimer;
 @property(nonatomic, assign) BOOL connBusy;
 @property(nonatomic, assign) BOOL connLost;
+// This session is being replaced on purpose (switch to Wi-Fi, disconnect)
+@property(nonatomic, assign) BOOL ending;
 @property(nonatomic, assign) NSUInteger connAttempts;
 @property(nonatomic, copy) NSString *hardwareSerial;
 @property(nonatomic, copy) NSString *wifiAddress;
@@ -760,6 +762,8 @@ normalized_address(NSString *input) {
             @"    out=$(\"$adb\" connect \"$addr\" 2>&1)\n"
             @"    case \"$out\" in\n"
             @"        *\"connected to\"*)\n"
+            @"            n=0; while kill -0 \"$6\" 2>/dev/null && [ $n -lt 100 ]; do\n"
+            @"                sleep 0.2; n=$((n + 1)); done\n"
             @"            exec \"$exe\" -s \"$addr\" >/dev/null 2>&1 ;;\n"
             @"    esac\n"
             @"done\n"
@@ -773,7 +777,8 @@ normalized_address(NSString *input) {
         helper.arguments = @[@"-c", script, @"sh", self.adb, self.serial ?: @"",
                              address, [self launcherPath],
                              [NSString stringWithFormat:@"%u",
-                                 kDefaultTcpipPort]];
+                                 kDefaultTcpipPort],
+                             [NSString stringWithFormat:@"%d", getpid()]];
         helper.standardOutput = NSFileHandle.fileHandleWithNullDevice;
         helper.standardError = NSFileHandle.fileHandleWithNullDevice;
         NSError *error = nil;
@@ -786,6 +791,12 @@ normalized_address(NSString *input) {
         [[NSUserDefaults standardUserDefaults]
             setObject:address forKey:kLastWifiAddressKey];
         [self flash:@"Switching to Wi-Fi… a new window will open"];
+
+        // The helper opens the new session once this process has quit. This
+        // window must not try to reconnect by itself (that would be a second
+        // instance), so it closes now.
+        self.ending = YES;
+        [self quitCurrentSession];
     }];
 }
 
@@ -793,10 +804,14 @@ normalized_address(NSString *input) {
     if (![self isWifiSerial]) {
         return;
     }
+    // The user asks for it: the window closes, it does not look for the device
+    self.ending = YES;
     [self runAdb:@[@"disconnect", self.serial]
         useSerial:NO
         stdoutFile:nil
-              done:nil];
+              done:^(int status, NSString *out, NSString *err) {
+        [self quitCurrentSession];
+    }];
 }
 
 - (void)insertTopMenu:(NSMenu *)menu title:(NSString *)title {
@@ -1915,12 +1930,17 @@ static NSString *const kQualityNames[] = {
 // session is started by a detached helper once this one has quit, so that the
 // device settings restored on quit are not applied over the new session's.
 - (void)restartSessionForSerial:(NSString *)serial {
+    // Wait until this process has quit (its window closes, its settings are given
+    // back), so that the new window takes its place and is not a second instance
     static NSString *const script =
-        @"sleep 2; exec \"$1\" ${2:+-s \"$2\"}";
+        @"n=0; while kill -0 \"$3\" 2>/dev/null && [ $n -lt 100 ]; do"
+        @" sleep 0.2; n=$((n + 1)); done;"
+        @" exec \"$1\" ${2:+-s \"$2\"}";
     NSTask *helper = [[NSTask alloc] init];
     helper.executableURL = [NSURL fileURLWithPath:@"/bin/sh"];
     helper.arguments = @[@"-c", script, @"sh", [self launcherPath],
-                         serial ?: @""];
+                         serial ?: @"",
+                         [NSString stringWithFormat:@"%d", getpid()]];
     helper.standardOutput = NSFileHandle.fileHandleWithNullDevice;
     helper.standardError = NSFileHandle.fileHandleWithNullDevice;
     if ([helper launchAndReturnError:nil]) {
@@ -4994,6 +5014,12 @@ live_info_text(NSDictionary *i) {
         return;
     }
     self.connLost = YES;
+    if (self.ending) {
+        // The device is changing of transport on purpose (the helper that does
+        // it opens the new session): this window just closes
+        [self quitCurrentSession];
+        return;
+    }
     self.connAttempts = 0;
     if (!self.connOverlay) {
         [self buildConnectionOverlay];
@@ -6600,6 +6626,29 @@ sc_macos_toolbar_init(SDL_Window *window, sc_toolbar_callback callback,
     g_controller.dropOverlay = overlay;
     g_controller.dropLabel = label;
 
+    // Debug: SCRCPY_TEST_WIFI="switch@10" or "disconnect@10" runs the items of the
+    // Device menu without the mouse
+    const char *test_wifi = getenv("SCRCPY_TEST_WIFI");
+    if (test_wifi) {
+        for (NSString *entry in [@(test_wifi) componentsSeparatedByString:@","]) {
+            NSArray *parts = [entry componentsSeparatedByString:@"@"];
+            if (parts.count != 2) {
+                continue;
+            }
+            NSString *name = parts[0];
+            dispatch_after(
+                dispatch_time(DISPATCH_TIME_NOW,
+                              (int64_t) ([parts[1] doubleValue] * NSEC_PER_SEC)),
+                dispatch_get_main_queue(), ^{
+                if ([name isEqualToString:@"switch"]) {
+                    [g_controller switchToWifi:nil];
+                } else if ([name isEqualToString:@"disconnect"]) {
+                    [g_controller disconnectWifi:nil];
+                }
+            });
+        }
+    }
+
     // Debug: SCRCPY_TEST_PREFS="show@8,keepOnTop=1@9,quality=saver@10,report@20"
     // changes the preferences like the window controls do
     const char *test_prefs = getenv("SCRCPY_TEST_PREFS");
@@ -6618,6 +6667,8 @@ sc_macos_toolbar_init(SDL_Window *window, sc_toolbar_callback callback,
                     [g_controller showPreferences:nil];
                 } else if ([name isEqualToString:@"defaults"]) {
                     [g_controller restoreDefaultPreferences];
+                } else if ([name isEqualToString:@"restart"]) {
+                    [g_controller prefsRestartStream:nil];
                 } else if ([name isEqualToString:@"report"]) {
                     [g_controller refreshPreferences];
                     NSMutableString *r = [NSMutableString string];

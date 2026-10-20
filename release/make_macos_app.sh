@@ -144,6 +144,25 @@ if [[ -n "$SERIAL" ]]; then
     # and each device has its own log
     [[ $HAS_S -eq 0 ]] && set -- -s "$SERIAL" "$@"
     LOG="$HOME/Library/Logs/scrcpy-${SERIAL//[^A-Za-z0-9._-]/_}.log"
+
+    # One session per device: a second launch of the same device (the app opened
+    # twice, a reconnection racing with a switch between cable and Wi-Fi) does
+    # nothing. exec keeps the pid, so the lock belongs to the running scrcpy.
+    LOCK_DIR="$HOME/Library/Caches/scrcpy-sessions"
+    mkdir -p "$LOCK_DIR"
+    LOCK="$LOCK_DIR/${SERIAL//[^A-Za-z0-9._-]/_}.pid"
+    acquire_lock() {
+        ( set -o noclobber; echo $$ > "$LOCK" ) 2>/dev/null && return 0
+        OLD="$(cat "$LOCK" 2>/dev/null)"
+        # A live scrcpy of that device holds it (this launcher before exec, or
+        # scrcpy-bin after it); else the lock is stale
+        if [[ -n "$OLD" ]] && ps -p "$OLD" -o args= 2>/dev/null | grep -q 'scrcpy.app/Contents/MacOS/scrcpy'; then
+            return 1
+        fi
+        rm -f "$LOCK"
+        ( set -o noclobber; echo $$ > "$LOCK" ) 2>/dev/null
+    }
+    acquire_lock || exit 0
 fi
 FPS="$(defaults read com.genymobile.scrcpy.app scrcpy.fps 2>/dev/null || echo auto)"
 
