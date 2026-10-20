@@ -10,6 +10,7 @@
 
 #include "controller.h"
 #include "file_pusher.h"
+#include "macos_toolbar.h"
 #include "options.h"
 #include "trait/gamepad_processor.h"
 #include "trait/key_processor.h"
@@ -31,6 +32,8 @@ struct sc_input_manager {
     bool clipboard_autosync;
 
     uint16_t sdl_shortcut_mods;
+
+    int side_pressed; // side button of the phone frame being pressed, or -1
 
     bool vfinger_down;
     bool vfinger_invert_x;
@@ -72,5 +75,11 @@ sc_input_manager_init(struct sc_input_manager *im,
 void
 sc_input_manager_handle_event(struct sc_input_manager *im,
                               const SDL_Event *event);
+
+// Press and release a navigation key (back, home, recents...) requested from a
+// UI toolbar button
+void
+sc_input_manager_press_toolbar_button(struct sc_input_manager *im,
+                                      enum sc_toolbar_button button);
 
 #endif

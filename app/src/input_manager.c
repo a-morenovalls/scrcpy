@@ -37,6 +37,7 @@ sc_input_manager_init(struct sc_input_manager *im,
     im->sdl_shortcut_mods = sc_shortcut_mods_to_sdl(params->shortcut_mods);
 
     im->vfinger_down = false;
+    im->side_pressed = SC_SIDE_NONE;
     im->vfinger_invert_x = false;
     im->vfinger_invert_y = false;
 
@@ -69,6 +70,131 @@ send_keycode(struct sc_input_manager *im, enum android_keycode keycode,
     if (!sc_controller_push_msg(im->controller, &msg)) {
         LOGW("Could not request 'inject %s'", name);
     }
+}
+
+static void
+send_keycode_meta(struct sc_input_manager *im, enum android_keycode keycode,
+                  enum sc_action action, uint32_t metastate) {
+    struct sc_control_msg msg;
+    msg.type = SC_CONTROL_MSG_TYPE_INJECT_KEYCODE;
+    msg.inject_keycode.action = action == SC_ACTION_DOWN
+                              ? AKEY_EVENT_ACTION_DOWN
+                              : AKEY_EVENT_ACTION_UP;
+    msg.inject_keycode.keycode = keycode;
+    msg.inject_keycode.metastate = metastate;
+    msg.inject_keycode.repeat = 0;
+
+    if (!sc_controller_push_msg(im->controller, &msg)) {
+        LOGW("Could not request 'inject keycode %d'", (int) keycode);
+    }
+}
+
+static void
+press_keycode_meta(struct sc_input_manager *im, enum android_keycode keycode,
+                   uint32_t metastate) {
+    send_keycode_meta(im, keycode, SC_ACTION_DOWN, metastate);
+    send_keycode_meta(im, keycode, SC_ACTION_UP, metastate);
+}
+
+#define META_CTRL (AMETA_CTRL_ON | AMETA_CTRL_LEFT_ON)
+
+// Mac text editing shortcuts, translated to the Android ones, so that they
+// work in the text fields of the device:
+//   Cmd+Backspace   clear the whole field
+//   Opt+Backspace   delete the previous word
+//   Opt+Delete      delete the next word
+//   Opt+Left/Right  move by word (Shift extends the selection)
+//   Cmd+Up/Down     move to the start/end of the text
+//   Cmd+A           select all
+//   Cmd+Z           undo (Shift+Cmd+Z: redo)
+// Return true if the key event was handled.
+static bool
+process_mac_edit_shortcut(struct sc_input_manager *im, SDL_Keycode keycode,
+                          uint16_t mod, bool down, bool repeat) {
+    bool gui = mod & SDL_KMOD_GUI;
+    bool alt = mod & SDL_KMOD_ALT;
+    bool shift = mod & SDL_KMOD_SHIFT;
+    if (gui == alt) {
+        // none, or both: not a Mac editing shortcut
+        return false;
+    }
+
+    enum android_keycode key = AKEYCODE_UNKNOWN;
+    uint32_t meta = 0;
+    bool select_all_first = false;
+    uint32_t shift_meta = shift ? AMETA_SHIFT_ON : 0;
+
+    switch (keycode) {
+        case SDLK_BACKSPACE:
+            key = AKEYCODE_DEL;
+            if (gui) {
+                select_all_first = true;
+            } else {
+                meta = META_CTRL;
+            }
+            break;
+        case SDLK_DELETE:
+            key = AKEYCODE_FORWARD_DEL;
+            if (gui) {
+                select_all_first = true;
+            } else {
+                meta = META_CTRL;
+            }
+            break;
+        case SDLK_LEFT:
+            if (!alt) {
+                return false; // Cmd+Left rotates the device
+            }
+            key = AKEYCODE_DPAD_LEFT;
+            meta = META_CTRL | shift_meta;
+            break;
+        case SDLK_RIGHT:
+            if (!alt) {
+                return false; // Cmd+Right rotates the device
+            }
+            key = AKEYCODE_DPAD_RIGHT;
+            meta = META_CTRL | shift_meta;
+            break;
+        case SDLK_UP:
+            if (!gui) {
+                return false;
+            }
+            key = AKEYCODE_MOVE_HOME;
+            meta = META_CTRL | shift_meta;
+            break;
+        case SDLK_DOWN:
+            if (!gui) {
+                return false;
+            }
+            key = AKEYCODE_MOVE_END;
+            meta = META_CTRL | shift_meta;
+            break;
+        case SDLK_A:
+            if (!gui) {
+                return false;
+            }
+            key = AKEYCODE_A;
+            meta = META_CTRL;
+            break;
+        case SDLK_Z:
+            if (!gui) {
+                return false;
+            }
+            key = AKEYCODE_Z;
+            meta = META_CTRL | shift_meta;
+            break;
+        default:
+            return false;
+    }
+
+    if (down) {
+        if (select_all_first && !repeat) {
+            press_keycode_meta(im, AKEYCODE_A, META_CTRL);
+        }
+        press_keycode_meta(im, key, meta);
+    }
+    // the release is swallowed too
+    return true;
 }
 
 static inline void
@@ -279,6 +405,19 @@ rotate_device(struct sc_input_manager *im) {
     }
 }
 
+// With the native bar, rotating the window (Cmd+Left/Right) rotates the device
+// itself (portrait <-> landscape) instead of rotating the video on the client
+// side. Return false if the device can't be rotated.
+static bool
+rotate_device_with_window(struct sc_input_manager *im,
+                          enum sc_rotate_direction direction) {
+    if (!im->screen->bottom_inset || !im->controller || im->camera) {
+        return false;
+    }
+    sc_macos_rotate_device(direction);
+    return true;
+}
+
 static void
 open_hard_keyboard_settings(struct sc_input_manager *im) {
     assert(im->controller && !im->camera);
@@ -374,11 +513,56 @@ sc_input_manager_process_text_input(struct sc_input_manager *im,
     im->kp->ops->process_text(im->kp, &evt);
 }
 
+// Cmd acts as Ctrl for the pinch-to-zoom gesture with the native bar (as in
+// the Android emulator on macOS)
+static inline bool
+is_pinch_ctrl(const struct sc_input_manager *im, SDL_Keymod mod) {
+    return (mod & SDL_KMOD_CTRL)
+        || (im->screen->bottom_inset && (mod & SDL_KMOD_GUI));
+}
+
+// Show the two virtual fingers while the pinch-to-zoom gesture is available:
+// a modifier held with the mouse over the screen, or the gesture in progress
+static void
+update_pinch_overlay(struct sc_input_manager *im) {
+    struct sc_screen *screen = im->screen;
+    if (!screen->bottom_inset || !screen->video || !im->controller
+            || im->camera || !im->mp) {
+        return;
+    }
+
+    SDL_Keymod mod = SDL_GetModState();
+    bool ctrl = is_pinch_ctrl(im, mod);
+    bool shift = mod & SDL_KMOD_SHIFT;
+    bool active = (ctrl || shift || im->vfinger_down)
+               && !screen->paused && !im->disconnected
+               && !im->mp->relative_mode
+               && (SDL_GetMouseFocus() == screen->window
+                   || getenv("SCRCPY_TEST_PINCH"));
+
+    float x = 0;
+    float y = 0;
+    SDL_GetMouseState(&x, &y);
+    // Ctrl  Shift     invert_x  invert_y
+    //   1     0           1         1      rotate / pinch
+    //   0     1           1         0      vertical tilt
+    //   1     1           0         1      horizontal tilt
+    bool invert_x = im->vfinger_down ? im->vfinger_invert_x : ctrl ^ shift;
+    bool invert_y = im->vfinger_down ? im->vfinger_invert_y : ctrl;
+    sc_screen_set_pinch(screen, active, x, y, invert_x, invert_y,
+                        im->vfinger_down);
+}
+
 static bool
 simulate_virtual_finger(struct sc_input_manager *im,
                         enum android_motionevent_action action,
                         struct sc_point point) {
     bool up = action == AMOTION_EVENT_ACTION_UP;
+
+    if (action != AMOTION_EVENT_ACTION_MOVE) {
+        LOGD("Virtual finger %s at (%d, %d)", up ? "up" : "down", point.x,
+             point.y);
+    }
 
     struct sc_control_msg msg;
     msg.type = SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT;
@@ -413,6 +597,9 @@ inverse_point(struct sc_point point, struct sc_size size,
 static void
 sc_input_manager_process_key(struct sc_input_manager *im,
                              const SDL_KeyboardEvent *event) {
+    // A modifier may have been pressed or released
+    update_pinch_overlay(im);
+
     // some key events do not interact with the device, so process the event
     // even if control is disabled
 
@@ -460,6 +647,14 @@ sc_input_manager_process_key(struct sc_input_manager *im,
             return;
     }
 
+    // Mac editing shortcuts (with the native bar only, as they take over some
+    // MOD shortcuts)
+    if (im->screen->bottom_inset && control && im->kp && !paused && !ctrl
+            && !im->camera && !disconnected
+            && process_mac_edit_shortcut(im, sdl_keycode, mod, down, repeat)) {
+        return;
+    }
+
     if (is_shortcut) {
         enum sc_action action = down ? SC_ACTION_DOWN : SC_ACTION_UP;
         switch (sdl_keycode) {
@@ -491,6 +686,9 @@ sc_input_manager_process_key(struct sc_input_manager *im,
                 if (video && !repeat && down) {
                     if (shift) {
                         apply_orientation_transform(im, SC_ORIENTATION_FLIP_0);
+                    } else if (rotate_device_with_window(im,
+                                                         SC_ROTATE_LEFT)) {
+                        // the device rotation replaces the client one
                     } else {
                         apply_orientation_transform(im, SC_ORIENTATION_270);
                     }
@@ -500,6 +698,9 @@ sc_input_manager_process_key(struct sc_input_manager *im,
                 if (video && !repeat && down) {
                     if (shift) {
                         apply_orientation_transform(im, SC_ORIENTATION_FLIP_0);
+                    } else if (rotate_device_with_window(im,
+                                                         SC_ROTATE_RIGHT)) {
+                        // the device rotation replaces the client one
                     } else {
                         apply_orientation_transform(im, SC_ORIENTATION_90);
                     }
@@ -633,7 +834,9 @@ sc_input_manager_process_key(struct sc_input_manager *im,
                     return;
                 case SDLK_R:
                     if (!repeat && !shift && down && !paused) {
-                        rotate_device(im);
+                        if (!rotate_device_with_window(im, SC_ROTATE_TOGGLE)) {
+                            rotate_device(im);
+                        }
                     }
                     return;
                 case SDLK_K:
@@ -755,6 +958,17 @@ sc_input_manager_process_mouse_motion(struct sc_input_manager *im,
         return;
     }
 
+    if (im->screen->bottom_inset) {
+        // Hover of the side buttons of the phone frame
+        sc_screen_set_side_state(
+            im->screen,
+            sc_screen_side_button_at(im->screen, event->x, event->y),
+            im->side_pressed);
+        if (im->side_pressed != SC_SIDE_NONE) {
+            return; // a side button is held: no touch drag
+        }
+    }
+
     struct sc_mouse_motion_event evt = {
         .position = sc_input_manager_get_position(im, event->x, event->y),
         .pointer_id = im->vfinger_down ? SC_POINTER_ID_GENERIC_FINGER
@@ -780,6 +994,7 @@ sc_input_manager_process_mouse_motion(struct sc_input_manager *im,
                                                 im->vfinger_invert_y);
         simulate_virtual_finger(im, AMOTION_EVENT_ACTION_MOVE, vfinger);
     }
+    update_pinch_overlay(im);
 }
 
 static void
@@ -833,6 +1048,53 @@ sc_input_manager_get_binding(const struct sc_mouse_binding_set *bindings,
     }
 }
 
+// Hardware buttons drawn on the side of the phone frame: a click on one of them
+// presses the key of the device (volume, power), as a real button would
+static enum android_keycode
+side_button_keycode(int button) {
+    switch (button) {
+        case SC_SIDE_VOLUME_UP: return AKEYCODE_VOLUME_UP;
+        case SC_SIDE_VOLUME_DOWN: return AKEYCODE_VOLUME_DOWN;
+        default: return AKEYCODE_POWER;
+    }
+}
+
+// Return true if the click was for a side button (the click is consumed)
+static bool
+process_side_button(struct sc_input_manager *im,
+                    const SDL_MouseButtonEvent *event) {
+    struct sc_screen *screen = im->screen;
+    if (!screen->bottom_inset || event->button != SDL_BUTTON_LEFT
+            || !im->controller || !im->kp) {
+        return false;
+    }
+
+    bool down = event->type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+    if (down) {
+        int button = sc_screen_side_button_at(screen, event->x, event->y);
+        if (button == SC_SIDE_NONE) {
+            return false;
+        }
+        LOGD("Side button %d pressed", button);
+        im->side_pressed = button;
+        send_keycode(im, side_button_keycode(button), SC_ACTION_DOWN, "side");
+        sc_screen_set_side_state(screen, button, button);
+        return true;
+    }
+
+    if (im->side_pressed != SC_SIDE_NONE) {
+        LOGD("Side button %d released", im->side_pressed);
+        send_keycode(im, side_button_keycode(im->side_pressed), SC_ACTION_UP,
+                     "side");
+        im->side_pressed = SC_SIDE_NONE;
+        sc_screen_set_side_state(
+            screen, sc_screen_side_button_at(screen, event->x, event->y),
+            SC_SIDE_NONE);
+        return true;
+    }
+    return false;
+}
+
 static void
 sc_input_manager_process_mouse_button(struct sc_input_manager *im,
                                       const SDL_MouseButtonEvent *event) {
@@ -852,6 +1114,10 @@ sc_input_manager_process_mouse_button(struct sc_input_manager *im,
     bool paused = im->screen->paused;
     bool down = event->type == SDL_EVENT_MOUSE_BUTTON_DOWN;
 
+    if (process_side_button(im, event)) {
+        return;
+    }
+
     enum sc_mouse_button button = sc_mouse_button_from_sdl(event->button);
     if (button == SC_MOUSE_BUTTON_UNKNOWN) {
         return;
@@ -863,7 +1129,7 @@ sc_input_manager_process_mouse_button(struct sc_input_manager *im,
     }
 
     SDL_Keymod keymod = SDL_GetModState();
-    bool ctrl_pressed = keymod & SDL_KMOD_CTRL;
+    bool ctrl_pressed = is_pinch_ctrl(im, keymod);
     bool shift_pressed = keymod & SDL_KMOD_SHIFT;
 
     if (control && !paused) {
@@ -1003,6 +1269,7 @@ sc_input_manager_process_mouse_button(struct sc_input_manager *im,
             return;
         }
         im->vfinger_down = down;
+        update_pinch_overlay(im);
     }
 }
 
@@ -1135,6 +1402,13 @@ sc_input_manager_process_file(struct sc_input_manager *im,
     }
 
     assert(event->type == SDL_EVENT_DROP_FILE);
+
+    if (im->screen->bottom_inset) {
+        // The native toolbar installs the APKs and sends the other files
+        sc_macos_drop_file(event->data);
+        return;
+    }
+
     char *file = strdup(event->data);
     if (!file) {
         LOG_OOM();
@@ -1150,6 +1424,78 @@ sc_input_manager_process_file(struct sc_input_manager *im,
     bool ok = sc_file_pusher_request(im->fp, action, file);
     if (!ok) {
         free(file);
+    }
+}
+
+void
+sc_input_manager_press_toolbar_button(struct sc_input_manager *im,
+                                      enum sc_toolbar_button button) {
+    if (!im->controller || !im->kp || im->camera || im->disconnected) {
+        return;
+    }
+
+    switch (button) {
+        case SC_TOOLBAR_BUTTON_BACK:
+            press_back_or_turn_screen_on(im, SC_ACTION_DOWN);
+            press_back_or_turn_screen_on(im, SC_ACTION_UP);
+            return;
+        case SC_TOOLBAR_BUTTON_NOTIFICATIONS:
+            expand_notification_panel(im);
+            return;
+        case SC_TOOLBAR_BUTTON_SETTINGS:
+            expand_settings_panel(im);
+            return;
+        case SC_TOOLBAR_BUTTON_ROTATE:
+            rotate_device(im);
+            return;
+        case SC_TOOLBAR_BUTTON_PASTE:
+            // store the Mac clipboard in the device clipboard and paste
+            set_device_clipboard(im, true, SC_SEQUENCE_INVALID);
+            return;
+        case SC_TOOLBAR_BUTTON_TYPE_CLIPBOARD:
+            // inject the text as input events (fields that refuse to paste)
+            clipboard_paste(im);
+            return;
+        case SC_TOOLBAR_BUTTON_SCREEN_OFF:
+            set_display_power(im, false);
+            return;
+        case SC_TOOLBAR_BUTTON_SCREEN_ON:
+            set_display_power(im, true);
+            return;
+        case SC_TOOLBAR_BUTTON_COPY:
+            get_device_clipboard(im, SC_COPY_KEY_COPY);
+            return;
+        case SC_TOOLBAR_BUTTON_DEV_MENU:
+            action_menu(im, SC_ACTION_DOWN);
+            action_menu(im, SC_ACTION_UP);
+            return;
+        case SC_TOOLBAR_BUTTON_DEV_RELOAD:
+            // React Native reloads on a double 'R' press
+            for (int i = 0; i < 2; ++i) {
+                send_keycode(im, AKEYCODE_R, SC_ACTION_DOWN, "R");
+                send_keycode(im, AKEYCODE_R, SC_ACTION_UP, "R");
+            }
+            return;
+        case SC_TOOLBAR_BUTTON_HOME:
+            action_home(im, SC_ACTION_DOWN);
+            action_home(im, SC_ACTION_UP);
+            return;
+        case SC_TOOLBAR_BUTTON_APP_SWITCH:
+            action_app_switch(im, SC_ACTION_DOWN);
+            action_app_switch(im, SC_ACTION_UP);
+            return;
+        case SC_TOOLBAR_BUTTON_VOLUME_DOWN:
+            action_volume_down(im, SC_ACTION_DOWN);
+            action_volume_down(im, SC_ACTION_UP);
+            return;
+        case SC_TOOLBAR_BUTTON_VOLUME_UP:
+            action_volume_up(im, SC_ACTION_DOWN);
+            action_volume_up(im, SC_ACTION_UP);
+            return;
+        case SC_TOOLBAR_BUTTON_POWER:
+            action_power(im, SC_ACTION_DOWN);
+            action_power(im, SC_ACTION_UP);
+            return;
     }
 }
 
